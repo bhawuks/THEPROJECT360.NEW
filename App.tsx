@@ -28,27 +28,35 @@ const App: React.FC = () => {
   const [reports, setReports] = useState<DailyReport[]>([]);
   const [editingReport, setEditingReport] = useState<DailyReport | null>(null);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [firebaseInitialized, setFirebaseInitialized] = useState(false);
+
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
-      // Only treat user as logged in if they exist AND their email is verified
-      if (firebaseUser && firebaseUser.emailVerified) {
-        const userData: User = {
-          id: firebaseUser.uid,
-          username: firebaseUser.displayName || firebaseUser.email?.split('@')[0] || 'User'
-        };
-        setUser(userData);
-        loadReports(userData.id);
-      } else {
-        // If user is logged in but unverified, the Auth component handles showing the verification screen
-        // by checking verification status during the login/registration process.
-        setUser(null);
-        setReports([]);
-      }
-      setLoading(false);
-    });
+    if (auth) {
+      setFirebaseInitialized(true);
+      const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
+        // Only treat user as logged in if they exist AND their email is verified
+        if (firebaseUser && firebaseUser.emailVerified) {
+          const userData: User = {
+            id: firebaseUser.uid,
+            username: firebaseUser.displayName || firebaseUser.email?.split('@')[0] || 'User'
+          };
+          setUser(userData);
+          loadReports(userData.id);
+        } else {
+          // If user is logged in but unverified, the Auth component handles showing the verification screen
+          // by checking verification status during the login/registration process.
+          setUser(null);
+          setReports([]);
+        }
+        setLoading(false);
+      });
 
-    return () => unsubscribe();
+      return () => unsubscribe();
+    } else {
+      setLoading(false);
+      setFirebaseInitialized(false);
+    }
   }, []);
 
   const loadReports = (userId: string) => {
@@ -56,6 +64,7 @@ const App: React.FC = () => {
   };
 
   const handleLogout = async () => {
+    if (!auth) return;
     try {
       await signOut(auth);
       setView('entry');
@@ -117,6 +126,11 @@ const App: React.FC = () => {
       </div>
     );
   }
+
+  if (!firebaseInitialized) {
+    return <Auth />
+  }
+
 
   if (!user) {
     return <Auth />;
