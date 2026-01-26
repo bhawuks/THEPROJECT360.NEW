@@ -1,6 +1,7 @@
 // Fix: Use standard modular import for initializeApp and getAuth from Firebase v9 SDK.
 import { initializeApp } from 'firebase/app';
 import { getAuth, GoogleAuthProvider, signInWithPopup } from 'firebase/auth';
+import { getFirestore } from 'firebase/firestore';
 
 const firebaseConfig = {
   apiKey: "AIzaSyDTRO2GXMtWQHWJWdafaXT4XMalPN1tMtc",
@@ -13,10 +14,12 @@ const firebaseConfig = {
 
 let app;
 let auth = null;
+let db = null;
 
 try {
   app = initializeApp(firebaseConfig);
   auth = getAuth(app);
+  db = getFirestore(app);
   console.log("Firebase initialized successfully.");
 } catch (error) {
   console.error(
@@ -35,4 +38,4 @@ export const signInWithGoogle = () => {
   }
 };
 
-export { auth };
+export { auth, db };
