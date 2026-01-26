@@ -2,7 +2,9 @@ import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { BaseEntry, DailyReport, RiskEntry, RiskImpact, RiskLikelihood, RiskStatus, EntryCategory, ActivityEntry, ResourceMemory } from '../types';
 import { UNITS, RISK_IMPACTS, RISK_LIKELIHOODS, RISK_STATUSES } from '../constants';
 import { Trash2, Plus, Save, ChevronLeft, ChevronDown, ChevronUp, Copy, CheckCircle2, Flag, AlertTriangle, Users, Package, Truck, Briefcase, LayoutList, Check, Calendar as CalendarIcon, ArrowLeft, X, TrendingDown, TrendingUp, DollarSign } from 'lucide-react';
-import { StorageService } from '../services/storageService';
+import { db } from '../services/firebaseService';
+import { doc, getDoc, setDoc, collection, getDocs, query, where, writeBatch } from 'firebase/firestore';
+
 
 // ✅ DND-KIT (Sortable list)
 import { DndContext, closestCenter, PointerSensor, useSensor, useSensors, DragEndEvent } from '@dnd-kit/core';
@@ -26,6 +28,109 @@ const getVisualIds = (acts: ActivityEntry[]) => {
   return Object.keys(grouped)
     .sort()
     .flatMap((cat) => grouped[cat].map((a) => a.id));
+};
+
+// Firestore returns untyped data; this keeps TS happy without changing UI logic.
+const coerceActivities = (v: unknown): ActivityEntry[] => (Array.isArray(v) ? (v as ActivityEntry[]) : []);
+
+// ------------------------------------------------------------------
+// ✅ FIRESTORE-BACKED STORAGE SERVICE (keeps EntryForm UI intact)
+// ------------------------------------------------------------------
+// Schema:
+// - users/{userId}/reports/{date}  (date = 'YYYY-MM-DD')
+// - users/{userId}/resourceMemory/main
+const emptyResourceMemory = (): ResourceMemory => ({
+  manpower: {},
+  material: {},
+  equipment: {},
+  subcontractor: {},
+  risk: {}
+});
+
+const StorageService = {
+  async getReportByDate(userId: string, date: string): Promise<DailyReport | null> {
+    const ref = doc(db, 'users', userId, 'reports', date);
+    const snap = await getDoc(ref);
+    return snap.exists() ? (snap.data() as DailyReport) : null;
+  },
+
+  async saveReport(report: DailyReport): Promise<void> {
+    const ref = doc(db, 'users', report.userId, 'reports', report.date);
+    await setDoc(ref, report, { merge: true });
+  },
+
+  async getReportsInRange(userId: string, startDate: string, endDate: string): Promise<DailyReport[]> {
+    const colRef = collection(db, 'users', userId, 'reports');
+    const qRef = query(colRef, where('date', '>=', startDate), where('date', '<=', endDate));
+    const snaps = await getDocs(qRef);
+    return snaps.docs.map(d => d.data() as DailyReport);
+  },
+
+  async getResourceMemory(userId: string): Promise<ResourceMemory> {
+    const ref = doc(db, 'users', userId, 'resourceMemory', 'main');
+    const snap = await getDoc(ref);
+    return snap.exists() ? (snap.data() as ResourceMemory) : emptyResourceMemory();
+  },
+
+  async saveResourceMemory(userId: string, mem: ResourceMemory): Promise<void> {
+    const ref = doc(db, 'users', userId, 'resourceMemory', 'main');
+    await setDoc(ref, mem, { merge: true });
+  },
+
+  async findActivityHistory(userId: string, activityId: string): Promise<boolean> {
+    // Note: This scans the user's reports. Fine for small/medium usage; can be optimized later with an index collection.
+    const colRef = collection(db, 'users', userId, 'reports');
+    const snaps = await getDocs(colRef);
+    const target = activityId.toUpperCase();
+    for (const d of snaps.docs) {
+      const rep = d.data() as DailyReport;
+      if (rep?.activities?.some(a => String(a.activityId || '').toUpperCase() === target)) return true;
+    }
+    return false;
+  },
+
+  async rippleShiftActivityIds(userId: string, activityId: string): Promise<void> {
+    // Shifts all activities with numeric part >= conflict upward by 1 across ALL reports.
+    const match = activityId.match(/(.*?)(\d+)/);
+    if (!match) return;
+    const prefix = match[1] || 'ACT-';
+    const conflictNum = parseInt(match[2], 10) || 0;
+
+    const colRef = collection(db, 'users', userId, 'reports');
+    const snaps = await getDocs(colRef);
+
+    const getNum = (idStr: string) => parseInt(String(idStr).match(/\d+/)?.[0] || '0', 10);
+
+    const batch = writeBatch(db);
+    let touched = 0;
+
+    snaps.docs.forEach(docSnap => {
+      const rep = docSnap.data() as DailyReport;
+      if (!rep?.activities?.length) return;
+
+      let changed = false;
+      const newActs = rep.activities.map(a => {
+        const aId = String(a.activityId || '');
+        const n = getNum(aId);
+        const p = aId.match(/^[^\d]+/)?.[0] || prefix;
+
+        if (p.toUpperCase() === prefix.toUpperCase() && n >= conflictNum) {
+          changed = true;
+          const next = `${p}${String(n + 1).padStart(5, '0')}`;
+          return { ...a, activityId: next };
+        }
+        return a;
+      });
+
+      if (changed) {
+        const ref = doc(db, 'users', userId, 'reports', rep.date);
+        batch.set(ref, { ...rep, activities: newActs, updatedAt: Date.now() }, { merge: true });
+        touched += 1;
+      }
+    });
+
+    if (touched > 0) await batch.commit();
+  }
 };
 
 // ------------------------------------------------------------------
@@ -314,6 +419,7 @@ export const EntryForm: React.FC<EntryFormProps> = ({ existingReport, onSave, on
   const [viewMode, setViewMode] = useState<'selector' | 'form'>('selector');
   const [browseYear, setBrowseYear] = useState(new Date().getFullYear());
   const [browseMonth, setBrowseMonth] = useState(new Date().getMonth());
+  const [monthHasReports, setMonthHasReports] = useState<Set<string>>(new Set());
 
   const [date, setDate] = useState<string>(existingReport?.date || new Date().toISOString().split('T')[0]);
   const [reportId, setReportId] = useState<string>(existingReport?.id || generateId());
@@ -321,7 +427,7 @@ export const EntryForm: React.FC<EntryFormProps> = ({ existingReport, onSave, on
   const [selectedActivityId, setSelectedActivityId] = useState<string | null>(null);
   const [expandedCategories, setExpandedCategories] = useState<Record<string, boolean>>({});
   const [toastMessage, setToastMessage] = useState<string | null>(null);
-  const [resourceMemory, setResourceMemory] = useState<ResourceMemory>(StorageService.getResourceMemory(currentUserId));
+  const [resourceMemory, setResourceMemory] = useState<ResourceMemory>(emptyResourceMemory());
   const [showCopyModal, setShowCopyModal] = useState(false);
   const [copyTargetDate, setCopyTargetDate] = useState('');
   const [showSavedDialog, setShowSavedDialog] = useState(false);
@@ -343,13 +449,18 @@ export const EntryForm: React.FC<EntryFormProps> = ({ existingReport, onSave, on
       const oldIndex = visualIds.indexOf(String(active.id));
       const newIndex = visualIds.indexOf(String(over.id));
       if (oldIndex === -1 || newIndex === -1) return prev;
+    
       const newVisualIds = arrayMove(visualIds, oldIndex, newIndex);
-      const byId = new Map(prev.map((a) => [a.id, a]));
-      const reordered = newVisualIds.map((id) => byId.get(id)!).filter(Boolean);
+      const byId = new Map(prev.map((a) => [a.id, a] as const));
+    
+      const reordered = newVisualIds
+        .map((id) => byId.get(id))
+        .filter((a): a is ActivityEntry => Boolean(a));
+    
       return reindexActivities(reordered);
     });
+    
   };
-
   const groupedActivities = useMemo(() => activities.reduce((acc, a) => {
     const cat = a.workCategory || 'Uncategorized';
     if (!acc[cat]) acc[cat] = [];
@@ -359,15 +470,77 @@ export const EntryForm: React.FC<EntryFormProps> = ({ existingReport, onSave, on
 
   useEffect(() => { if (existingReport) { setViewMode('form'); setDate(existingReport.date); } }, [existingReport]);
 
+  // ✅ Load resource memory from Firestore
   useEffect(() => {
-    if (existingReport && existingReport.date === date) {
-      setReportId(existingReport.id); setActivities(existingReport.activities || []);
-    } else {
-      const existing = StorageService.getReportByDate(currentUserId, date);
-      if (existing) { setReportId(existing.id); setActivities(existing.activities || []); } 
-      else { setReportId(generateId()); setActivities([]); setSelectedActivityId(null); }
-    }
-    setSelectedActivityId(null);
+    let cancelled = false;
+    (async () => {
+      try {
+        const mem = await StorageService.getResourceMemory(currentUserId);
+        if (!cancelled) setResourceMemory(mem);
+      } catch {
+        // keep default empty memory
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [currentUserId]);
+
+  // ✅ Prefetch reports for the currently browsed month (for calendar dots)
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const start = `${browseYear}-${String(browseMonth + 1).padStart(2, '0')}-01`;
+        const end = `${browseYear}-${String(browseMonth + 1).padStart(2, '0')}-${String(new Date(browseYear, browseMonth + 1, 0).getDate()).padStart(2, '0')}`;
+        const reps = await StorageService.getReportsInRange(currentUserId, start, end);
+        if (cancelled) return;
+        setMonthHasReports(new Set(reps.map(r => r.date)));
+      } catch {
+        if (!cancelled) setMonthHasReports(new Set());
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [currentUserId, browseYear, browseMonth]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      // 1) If parent passed an existingReport for this date, use it
+      if (existingReport && existingReport.date === date) {
+        if (cancelled) return;
+        setReportId(existingReport.id);
+        setActivities(coerceActivities((existingReport as any).activities));
+        setSelectedActivityId(null);
+        return;
+      }
+
+      // 2) Otherwise load from Firestore by date
+      try {
+        const existing = await StorageService.getReportByDate(currentUserId, date);
+        if (cancelled) return;
+
+        if (existing) {
+          setReportId(existing.id || existing.date || generateId());
+          setActivities(coerceActivities((existing as any).activities));
+        } else {
+          setReportId(generateId());
+          setActivities([]);
+          setSelectedActivityId(null);
+        }
+      } catch {
+        if (cancelled) return;
+        // Fail-safe: don't crash UI
+        setReportId(generateId());
+        setActivities([]);
+        setSelectedActivityId(null);
+      }
+
+      setSelectedActivityId(null);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, [existingReport, date, currentUserId]);
 
   useEffect(() => { setAsOnDate(date); }, [date, selectedActivityId]);
@@ -404,14 +577,14 @@ export const EntryForm: React.FC<EntryFormProps> = ({ existingReport, onSave, on
   };
 
   const handleActivityIdBlur = (id: string, newIdString: string) => {
-    requestAnimationFrame(() => {
+    requestAnimationFrame(() => { (async () => {
       const upperId = newIdString.toUpperCase();
-      const conflictInHistory = StorageService.findActivityHistory(currentUserId, upperId);
+      const conflictInHistory = await StorageService.findActivityHistory(currentUserId, upperId);
       const conflictInCurrent = activities.some(a => a.activityId === upperId && a.id !== id);
       if (conflictInHistory || conflictInCurrent) {
         const confirmShift = window.confirm(`Activity ID "${upperId}" is already in use.\n\nOK: Insert here and SHIFT existing activities down.\nCancel: Keep duplicate ID.`);
         if (confirmShift) {
-          StorageService.rippleShiftActivityIds(currentUserId, upperId);
+          await StorageService.rippleShiftActivityIds(currentUserId, upperId);
           const getNum = (idStr: string) => parseInt(idStr.match(/\d+/)?.[0] || '0');
           const conflictNum = getNum(upperId);
           setActivities(prev => prev.map(a => {
@@ -427,7 +600,7 @@ export const EntryForm: React.FC<EntryFormProps> = ({ existingReport, onSave, on
           setToastMessage("Activities shifted successfully.");
         } else { updateActivityField(id, 'activityId', upperId); }
       } else { updateActivityField(id, 'activityId', upperId); }
-    });
+    })(); });
   };
 
   const updateActivityField = (id: string, field: keyof ActivityEntry, value: any) => {
@@ -479,7 +652,7 @@ export const EntryForm: React.FC<EntryFormProps> = ({ existingReport, onSave, on
     setActivities(prev => prev.map(a => a.id === selectedActivityId ? { ...a, risks: a.risks.map(r => r.id === itemId ? { ...r, [field]: value } : r) } : a));
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     const report: DailyReport = { id: reportId, userId: currentUserId, createdAt: existingReport?.createdAt || Date.now(), updatedAt: Date.now(), date, activities };
     const newMemory = { ...resourceMemory };
     activities.forEach(act => {
@@ -490,17 +663,17 @@ export const EntryForm: React.FC<EntryFormProps> = ({ existingReport, onSave, on
       act.risks.forEach(r => { if (r.code) newMemory.risk[r.code] = { description: r.description, likelihood: r.likelihood, impact: r.impact, mitigation: r.mitigation, status: r.status }; });
     });
     setResourceMemory(newMemory);
-    StorageService.saveResourceMemory(currentUserId, newMemory);
-    StorageService.saveReport(report);
+    await StorageService.saveResourceMemory(currentUserId, newMemory);
+    await await StorageService.saveReport(report);
     onSave(report);
     window.scrollTo({ top: 0, behavior: 'smooth' });
     setShowSavedDialog(true);
   };
 
-  const handleCopyReport = () => {
+  const handleCopyReport = async () => {
     if (!copyTargetDate) return;
     const report: DailyReport = { id: generateId(), userId: currentUserId, createdAt: Date.now(), updatedAt: Date.now(), date: copyTargetDate, activities: JSON.parse(JSON.stringify(activities)) };
-    StorageService.saveReport(report);
+    await StorageService.saveReport(report);
     setToastMessage(`Record duplicated to ${copyTargetDate}`);
     setShowCopyModal(false);
   };
@@ -534,7 +707,7 @@ export const EntryForm: React.FC<EntryFormProps> = ({ existingReport, onSave, on
             {blanks.map(b => <div key={`blank-${b}`}></div>)}
             {days.map(d => {
               const currentDateStr = `${browseYear}-${String(browseMonth + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
-              const hasReport = !!StorageService.getReportByDate(currentUserId, currentDateStr);
+              const hasReport = monthHasReports.has(currentDateStr);
               return (
                 <button key={d} onClick={() => { setDate(currentDateStr); setViewMode('form'); }} className={`aspect-square rounded-xl border-2 flex flex-col items-center justify-center relative transition-all group ${hasReport ? 'bg-gray-100 border-black' : 'bg-white border-gray-200 hover:border-black'}`}>
                   <span className={`text-lg font-black ${hasReport ? 'text-black' : 'text-gray-600 group-hover:text-black'}`}>{d}</span>

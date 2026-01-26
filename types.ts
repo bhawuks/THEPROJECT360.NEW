@@ -131,6 +131,7 @@ export interface DailyReport {
 export interface User {
   id: string;
   username: string;
+  email?: string | null;
 }
 
 export type ViewState = 'entry' | 'history' | 'milestones' | 'barchart';

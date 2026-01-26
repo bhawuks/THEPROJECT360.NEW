@@ -1,11 +1,58 @@
 import React, { useState, useMemo } from 'react';
 import { DailyReport, ActivityEntry } from '../types';
-import { StorageService } from '../services/storageService';
 import { Search, Download, Table2, Flag } from 'lucide-react';
 
 interface MilestonesProps {
   reports: DailyReport[];
 }
+
+
+
+// ✅ Local CSV exporter (replaces StorageService.exportToCSV)
+const exportToCSV = (reports: DailyReport[]) => {
+  // Flatten activities into rows
+  const rows: Record<string, any>[] = [];
+  reports.forEach((r) => {
+    (r.activities || []).forEach((a: any) => {
+      rows.push({
+        date: r.date,
+        activityId: a.activityId || '',
+        description: a.description || '',
+        category: a.workCategory || '',
+        workArea: a.workArea || '',
+        stationGrid: a.stationGrid || '',
+        plannedStart: a.plannedStart || '',
+        plannedFinish: a.plannedFinish || '',
+        actualStart: a.actualStart || '',
+        actualFinish: a.actualFinish || '',
+        milestone: a.isMilestone ? 'YES' : 'NO',
+      });
+    });
+  });
+
+  if (rows.length === 0) return;
+
+  const escape = (v: any) => {
+    const s = String(v ?? '');
+    // Wrap fields that contain comma/quote/newline in quotes and escape quotes
+    if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+    return s;
+  };
+
+  const headers = Object.keys(rows[0]);
+  const csv = [
+    headers.join(','),
+    ...rows.map((row) => headers.map((h) => escape(row[h])).join(',')),
+  ].join('\n');
+
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'milestones.csv';
+  a.click();
+  URL.revokeObjectURL(url);
+};
 
 export const Milestones: React.FC<MilestonesProps> = ({ reports }) => {
   const [search, setSearch] = useState('');
@@ -59,7 +106,7 @@ export const Milestones: React.FC<MilestonesProps> = ({ reports }) => {
   const milestones = filteredSchedule.filter(x => milestoneIds.has(x.activityId));
 
   const handleExport = () => {
-      StorageService.exportToCSV(reports);
+      exportToCSV(reports);
   };
 
   return (

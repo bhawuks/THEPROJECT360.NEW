@@ -3,7 +3,12 @@ import React, { useState, useEffect } from 'react';
 import { onAuthStateChanged, signOut } from 'firebase/auth';
 import { auth } from './services/firebaseService';
 import { DailyReport, User, ViewState } from './types';
-import { StorageService } from './services/storageService';
+import {
+  addUser,
+  saveReport,
+  getReports,
+  deleteReport,
+} from './services/firestoreService';
 import { EntryForm } from './components/EntryForm';
 import { History } from './components/History';
 import { Milestones } from './components/Milestones';
@@ -19,7 +24,7 @@ import {
   Menu,
   X,
   Loader2,
-  BarChart2
+  BarChart2,
 } from 'lucide-react';
 
 const App: React.FC = () => {
@@ -27,26 +32,29 @@ const App: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState<ViewState>('entry');
   const [reports, setReports] = useState<DailyReport[]>([]);
-  const [editingReport, setEditingReport] = useState<DailyReport | null>(null);
+  const [editingReport, setEditingReport] = useState<DailyReport | null>(
+    null
+  );
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [firebaseInitialized, setFirebaseInitialized] = useState(false);
-
 
   useEffect(() => {
     if (auth) {
       setFirebaseInitialized(true);
       const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
-        // Only treat user as logged in if they exist AND their email is verified
         if (firebaseUser && firebaseUser.emailVerified) {
           const userData: User = {
             id: firebaseUser.uid,
-            username: firebaseUser.displayName || firebaseUser.email?.split('@')[0] || 'User'
+            username:
+              firebaseUser.displayName ||
+              firebaseUser.email?.split('@')[0] ||
+              'User',
+            email: firebaseUser.email,
           };
           setUser(userData);
+          addUser(userData);
           loadReports(userData.id);
         } else {
-          // If user is logged in but unverified, the Auth component handles showing the verification screen
-          // by checking verification status during the login/registration process.
           setUser(null);
           setReports([]);
         }
@@ -60,8 +68,9 @@ const App: React.FC = () => {
     }
   }, []);
 
-  const loadReports = (userId: string) => {
-    setReports(StorageService.getReports(userId));
+  const loadReports = async (userId: string) => {
+    const reportsFromDb = await getReports(userId);
+    setReports(reportsFromDb);
   };
 
   const handleLogout = async () => {
@@ -70,20 +79,20 @@ const App: React.FC = () => {
       await signOut(auth);
       setView('entry');
     } catch (error) {
-      console.error("Logout error", error);
+      console.error('Logout error', error);
     }
   };
 
-  const handleSaveReport = (report: DailyReport) => {
+  const handleSaveReport = async (report: DailyReport) => {
     if (!user) return;
-    StorageService.saveReport(report);
+    await saveReport(user.id, report);
     loadReports(user.id);
     setEditingReport(report);
   };
 
-  const handleDeleteReport = (id: string) => {
+  const handleDeleteReport = async (id: string) => {
     if (!user) return;
-    StorageService.deleteReport(user.id, id);
+    await deleteReport(user.id, id);
     loadReports(user.id);
     if (editingReport?.id === id) setEditingReport(null);
   };
@@ -97,7 +106,7 @@ const App: React.FC = () => {
   const NavButton = ({
     target,
     icon: Icon,
-    label
+    label,
   }: {
     target: ViewState;
     icon: any;
@@ -129,9 +138,8 @@ const App: React.FC = () => {
   }
 
   if (!firebaseInitialized) {
-    return <Auth />
+    return <Auth />;
   }
-
 
   if (!user) {
     return <Auth />;
@@ -143,13 +151,16 @@ const App: React.FC = () => {
       <header className="bg-white border-b-2 border-black p-4 flex justify-between items-center md:hidden sticky top-0 z-50">
         <div className="flex items-center gap-2">
           <Construction className="text-black" size={24} />
-          <span className="font-black text-xl tracking-tight">THEPROJECT 360</span>
+          <span className="font-black text-xl tracking-tight">
+            THEPROJECT 360
+          </span>
         </div>
         <button
           onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
           className="text-black"
         >
-          {mobileMenuOpen ? <X size={28} /> : <Menu size={28} />}
+          {mobileMenuOpen ? <X size={28} /> : <Menu size={28} />
+}
         </button>
       </header>
 
@@ -158,21 +169,31 @@ const App: React.FC = () => {
         className={`
             fixed inset-0 bg-white z-40 transform transition-transform duration-300 ease-in-out
             md:relative md:translate-x-0 md:w-64 md:h-screen md:border-r-2 md:border-black md:flex md:flex-col md:sticky md:top-0
-            ${mobileMenuOpen ? 'translate-x-0 pt-20 px-4' : '-translate-x-full md:p-0'}
+            ${
+              mobileMenuOpen
+                ? 'translate-x-0 pt-20 px-4'
+                : '-translate-x-full md:p-0'
+            }
         `}
       >
         <div className="hidden md:flex p-6 border-b-2 border-black items-center gap-3">
           <div className="p-2 bg-black rounded-lg text-white">
             <Construction size={24} />
           </div>
-          <h1 className="font-black text-xl tracking-tight">THEPROJECT 360</h1>
+          <h1 className="font-black text-xl tracking-tight">
+            THEPROJECT 360
+          </h1>
         </div>
 
         <nav className="flex-1 p-4 space-y-2">
           <NavButton target="entry" icon={PlusCircle} label="Daily Records" />
           <NavButton target="history" icon={HistoryIcon} label="History" />
           <NavButton target="milestones" icon={Flag} label="Milestones" />
-          <NavButton target="barchart" icon={BarChart2} label="Duration Analysis" />
+          <NavButton
+            target="barchart"
+            icon={BarChart2}
+            label="Duration Analysis"
+          />
         </nav>
 
         <div className="p-4 border-t-2 border-black mt-auto">
@@ -186,7 +207,10 @@ const App: React.FC = () => {
                 Site Supervisor
               </p>
             </div>
-            <button onClick={handleLogout} className="text-gray-400 hover:text-black">
+            <button
+              onClick={handleLogout}
+              className="text-gray-400 hover:text-black"
+            >
               <LogOut size={18} />
             </button>
           </div>
