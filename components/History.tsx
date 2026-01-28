@@ -426,7 +426,7 @@ export const History: React.FC<HistoryProps> = ({ reports, onEdit }) => {
       )}
 
       {/* Header / Filter Bar */}
-      <div className="flex flex-col xl:flex-row justify-between items-start xl:items-center gap-4 bg-white p-4 rounded-xl shadow-sm border-2 border-black sticky top-0 z-50">
+      <div className="flex flex-col xl:flex-row justify-between items-start xl:items-center gap-4 bg-white p-4 rounded-xl shadow-sm border-2 border-black">
         <div className="w-full xl:w-auto">
           <div className="relative w-full md:w-64">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-black" size={18} />

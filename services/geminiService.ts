@@ -4,7 +4,7 @@ import { DailyReport } from "../types";
 export const GeminiService = {
   analyzeReport: async (report: DailyReport): Promise<string> => {
     // Fix: Instantiate GoogleGenAI inside the method to ensure the most up-to-date API key is used.
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+    const ai = new GoogleGenAI(import.meta.env.VITE_API_KEY);
     try {
       const prompt = `
         You are a senior construction project manager. Analyze the following daily site report and provide a brief, professional executive summary (max 200 words).
@@ -34,7 +34,7 @@ export const GeminiService = {
      if (reports.length === 0) return "Not enough data for trend analysis.";
 
      // Fix: Instantiate GoogleGenAI inside the method to ensure the most up-to-date API key is used.
-     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+     const ai = new GoogleGenAI(import.meta.env.VITE_API_KEY);
 
      // Take last 5 reports for trend analysis
      const recentReports = reports.slice(-5);
@@ -67,7 +67,7 @@ export const GeminiService = {
 
   chatWithProjectData: async (message: string, reports: DailyReport[], history: {role: string, text: string}[]): Promise<string> => {
     // Fix: Instantiate GoogleGenAI inside the method to ensure the most up-to-date API key is used.
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+    const ai = new GoogleGenAI(import.meta.env.VITE_API_KEY);
     try {
       // Optimize context: Take the last 10 reports and map to essential data to save tokens
       const recentReports = reports

@@ -1,5 +1,11 @@
 {
   "projects": {
     "default": "theproject360-360"
+  },
+  "targets": {},
+  "etags": {
+    "theproject360-360": {
+      "extensionInstances": {}
+    }
   }
 }
