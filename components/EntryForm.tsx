@@ -3,7 +3,7 @@ import { BaseEntry, DailyReport, RiskEntry, RiskImpact, RiskLikelihood, RiskStat
 import { UNITS, RISK_IMPACTS, RISK_LIKELIHOODS, RISK_STATUSES } from '../constants';
 import { Trash2, Plus, Save, ChevronLeft, ChevronDown, ChevronUp, Copy, CheckCircle2, Flag, AlertTriangle, Users, Package, Truck, Briefcase, LayoutList, Check, Calendar as CalendarIcon, ArrowLeft, X, TrendingDown, TrendingUp, DollarSign } from 'lucide-react';
 import { db } from '../services/firebaseService';
-import { doc, getDoc, setDoc, collection, getDocs, query, where, writeBatch } from 'firebase/firestore';
+import { doc, getDoc, setDoc, collection, getDocs, query, where, writeBatch, orderBy, limit } from 'firebase/firestore';
 
 
 // ✅ DND-KIT (Sortable list)
@@ -33,6 +33,53 @@ const getVisualIds = (acts: ActivityEntry[]) => {
 // Firestore returns untyped data; this keeps TS happy without changing UI logic.
 const coerceActivities = (v: unknown): ActivityEntry[] => (Array.isArray(v) ? (v as ActivityEntry[]) : []);
 
+
+
+// ------------------------------------------------------------------
+// ✅ MANPOWER SMART MEMORY (Name-based templates saved in Firestore)
+// ------------------------------------------------------------------
+type ManpowerTemplate = {
+  nameKey: string;
+  name: string;
+  trade?: string;
+  unit?: string;
+  regularHours?: number;
+  overtime?: number;
+  cost?: number;
+  updatedAt: number;
+};
+
+const normalizeKey = (s: string) =>
+  String(s || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+
+const safeDocId = (nameKey: string) =>
+  encodeURIComponent(nameKey).replace(/%/g, "_"); // Firestore doc id safe
+
+const toTitleCase = (s: string) =>
+  String(s || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .split(" ")
+    .filter(Boolean)
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join(" ");
+
+const normalizeUnit = (s: string) => {
+  const v = String(s || "").trim();
+  if (!v) return v;
+  const low = v.toLowerCase();
+  if (["hr", "hrs", "hour", "hours", "h"].includes(low)) return "Hrs";
+  if (["day", "days", "d"].includes(low)) return "Day";
+  return v;
+};
+
+const numOr = (v: any, fallback = 0) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+};
 // ------------------------------------------------------------------
 // ✅ FIRESTORE-BACKED STORAGE SERVICE (keeps EntryForm UI intact)
 // ------------------------------------------------------------------
@@ -428,6 +475,11 @@ export const EntryForm: React.FC<EntryFormProps> = ({ existingReport, onSave, on
   const [expandedCategories, setExpandedCategories] = useState<Record<string, boolean>>({});
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [resourceMemory, setResourceMemory] = useState<ResourceMemory>(emptyResourceMemory());
+
+  const [mpTemplates, setMpTemplates] = useState<ManpowerTemplate[]>([]);
+  const mpTemplateMap = useMemo(() => new Map(mpTemplates.map(t => [t.nameKey, t] as const)), [mpTemplates]);
+  const mpSaveTimerRef = useRef<number | null>(null);
+
   const [showCopyModal, setShowCopyModal] = useState(false);
   const [copyTargetDate, setCopyTargetDate] = useState('');
   const [showSavedDialog, setShowSavedDialog] = useState(false);
@@ -483,6 +535,40 @@ export const EntryForm: React.FC<EntryFormProps> = ({ existingReport, onSave, on
     })();
     return () => { cancelled = true; };
   }, [currentUserId]);
+
+  // ✅ Load manpower templates (Name-based smart memory) from Firestore
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const colRef = collection(db, 'users', currentUserId, 'manpowerTemplates');
+        const qRef = query(colRef, orderBy('updatedAt', 'desc'), limit(50));
+        const snaps = await getDocs(qRef);
+        if (cancelled) return;
+        const list: ManpowerTemplate[] = snaps.docs.map(d => {
+          const data: any = d.data() || {};
+          const name = String(data.name || data.displayName || '').trim();
+          const nameKey = normalizeKey(name || decodeURIComponent(String(d.id).replace(/_/g, '%')));
+          return {
+            nameKey,
+            name: name || String(data.nameKey || '').trim() || '',
+            trade: data.trade || '',
+            unit: data.unit || '',
+            regularHours: numOr(data.regularHours, 0),
+            overtime: numOr(data.overtime, 0),
+            cost: data.cost !== undefined ? numOr(data.cost, 0) : undefined,
+            updatedAt: numOr(data.updatedAt, 0)
+          };
+        }).filter(t => t.nameKey && t.name);
+        setMpTemplates(list);
+      } catch {
+        if (!cancelled) setMpTemplates([]);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [currentUserId]);
+
+
 
   // ✅ Prefetch reports for the currently browsed month (for calendar dots)
   useEffect(() => {
@@ -638,7 +724,91 @@ export const EntryForm: React.FC<EntryFormProps> = ({ existingReport, onSave, on
       }
     });
   };
-  const deleteItemFromActivity = (category: EntryCategory, itemId: string) => {
+  
+
+  // ------------------------------------------------------------------
+  // ✅ Manpower smart memory (Name → auto-fill other cells + suggestions)
+  // ------------------------------------------------------------------
+  const queueSaveManpowerTemplate = useCallback((row: any) => {
+    const rawName = String(row?.name || "").trim();
+    const nameKey = normalizeKey(rawName);
+    if (!nameKey) return;
+
+    const template: ManpowerTemplate = {
+      nameKey,
+      name: toTitleCase(rawName),
+      trade: toTitleCase(String(row?.trade || "")),
+      unit: normalizeUnit(String(row?.unit || "")),
+      regularHours: numOr(row?.quantity, 0),
+      overtime: numOr((row as any)?.overtime, 0),
+      cost: row?.cost !== undefined && row?.cost !== "" ? numOr(row?.cost, 0) : undefined,
+      updatedAt: Date.now(),
+    };
+
+    // Debounce writes (keeps Firestore cost low + avoids spam)
+    if (mpSaveTimerRef.current) window.clearTimeout(mpSaveTimerRef.current);
+    mpSaveTimerRef.current = window.setTimeout(async () => {
+      try {
+        const docId = safeDocId(template.nameKey);
+        const ref = doc(db, "users", currentUserId, "manpowerTemplates", docId);
+        await setDoc(ref, template, { merge: true });
+
+        // Update local list so suggestions are instant
+        setMpTemplates((prev) => {
+          const others = prev.filter((t) => t.nameKey !== template.nameKey);
+          return [template, ...others].slice(0, 50);
+        });
+      } catch {
+        // no-op
+      }
+    }, 500);
+  }, [currentUserId, mpSaveTimerRef]);
+
+  const applyManpowerTemplate = useCallback((itemId: string, rawName: string) => {
+    const nameKey = normalizeKey(rawName);
+    if (!nameKey) return;
+    const tpl = mpTemplateMap.get(nameKey);
+    if (!tpl) return;
+
+    setActivities((prev) =>
+      prev.map((a) => {
+        if (a.id !== selectedActivityId) return a;
+        const updated = (a.manpower || []).map((m: any) => {
+          if (m.id !== itemId) return m;
+
+          const next: any = { ...m };
+
+          // Only fill if empty/zero (user can still override anytime)
+          if (!String(next.trade || "").trim() && tpl.trade) next.trade = tpl.trade;
+          if (!String(next.unit || "").trim() && tpl.unit) next.unit = tpl.unit;
+          if (!numOr(next.quantity, 0) && tpl.regularHours !== undefined) next.quantity = tpl.regularHours;
+          if (!numOr(next.overtime, 0) && tpl.overtime !== undefined) next.overtime = tpl.overtime;
+          if ((next.cost === undefined || next.cost === "" || numOr(next.cost, 0) === 0) && tpl.cost !== undefined) next.cost = tpl.cost;
+
+          return next;
+        });
+
+        return { ...a, manpower: updated };
+      })
+    );
+
+    setToastMessage("Manpower template applied.");
+  }, [mpTemplateMap, selectedActivityId]);
+
+  const handleManpowerNameBlur = useCallback((itemId: string, row: any) => {
+    // Apply from existing template first (if any)
+    applyManpowerTemplate(itemId, row?.name || "");
+
+    // Then persist latest values as the new template
+    queueSaveManpowerTemplate({
+      ...row,
+      name: toTitleCase(String(row?.name || "")),
+      trade: toTitleCase(String(row?.trade || "")),
+      unit: normalizeUnit(String(row?.unit || "")),
+    });
+  }, [applyManpowerTemplate, queueSaveManpowerTemplate]);
+
+const deleteItemFromActivity = (category: EntryCategory, itemId: string) => {
     const key = category as keyof ActivityEntry;
     setActivities(prev => prev.map(a => a.id === selectedActivityId ? { ...a, [key]: (a[key] as any[]).filter(i => i.id !== itemId) } : a));
   };
@@ -752,7 +922,15 @@ export const EntryForm: React.FC<EntryFormProps> = ({ existingReport, onSave, on
     const scheduleVarianceQty = plannedQtyExpected !== null ? actualQty - plannedQtyExpected : null;
     const spi = plannedQtyExpected && plannedQtyExpected > 0 ? actualQty / plannedQtyExpected : null;
 
-    return { plannedDur, actualDurFull, actualDurToDate, durationVariance, startDelay, finishDelay, plannedQty, actualQty, unit, plannedPctAsOn, actualPct, plannedQtyExpected, shortfall, plannedRate, actualRate, scheduleVarianceQty, spi };
+    const cm = buildCostModelForActivity(act);
+    const plannedCostTotal = cm.total.mostLikely;
+    const pv = plannedPctAsOn !== null ? (plannedCostTotal * plannedPctAsOn) / 100 : null;
+    const ev = actualPct !== null ? (plannedCostTotal * actualPct) / 100 : null;
+    const ac = (actualDurToDate && actualDurToDate > 0) ? (cm.daily.total * actualDurToDate) : (cm.daily.total || 0);
+    const cpi = ev !== null && ac > 0 ? ev / ac : null;
+    const performancePct = (plannedRate !== null && actualRate !== null && plannedRate > 0) ? (actualRate / plannedRate) * 100 : null;
+
+    return { plannedDur, actualDurFull, actualDurToDate, durationVariance, startDelay, finishDelay, plannedQty, actualQty, unit, plannedPctAsOn, actualPct, plannedQtyExpected, shortfall, plannedRate, actualRate, scheduleVarianceQty, spi, cpi, performancePct };
   }, [act, asOnDate]);
 
   const costModel = useMemo(() => {
@@ -894,62 +1072,31 @@ export const EntryForm: React.FC<EntryFormProps> = ({ existingReport, onSave, on
                 </div>
               </div>
 
-              <div className="bg-white p-6 rounded-2xl border-2 border-black shadow-sm">
-                <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 mb-4">
-                  <div>
-                    <h3 className="font-black uppercase text-lg tracking-tight">Schedule & Delay Calculator</h3>
-                    <p className="text-xs font-bold text-gray-500">Auto-calculated (Dates are Inclusive)</p>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-[10px] font-black uppercase text-gray-500">As on</span>
-                    <input type="date" value={asOnDate} onChange={(e) => setAsOnDate(e.target.value)} className="font-bold p-2 rounded-lg border-2 border-black outline-none bg-white text-xs" />
-                  </div>
-                </div>
-
-                {formula ? (
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
-                    <div className="bg-gray-50 border border-gray-200 rounded-xl p-4">
-                      <div className="font-black uppercase text-gray-500 mb-2">1) Planned vs Actual Durations</div>
-                      <div className="flex justify-between gap-3"><span className="font-bold text-gray-500">Planned Duration</span><span className="font-black text-black">{formula.plannedDur ?? '-'} days</span></div>
-                      <div className="flex justify-between gap-3 mt-1"><span className="font-bold text-gray-500">Actual Duration</span><span className="font-black text-black">{formula.actualDurFull ?? formula.actualDurToDate ?? '-'} days {!formula.actualDurFull && formula.actualDurToDate ? '(to-date)' : ''}</span></div>
-                      <div className="flex justify-between gap-3 mt-2 pt-2 border-t border-gray-200"><span className="font-bold text-gray-500">Duration Variance</span><span className="font-black">{formula.durationVariance === null ? '-' : (formula.durationVariance > 0 ? `+${formula.durationVariance}` : `${formula.durationVariance}`)} days</span></div>
-                    </div>
-                    <div className="bg-gray-50 border border-gray-200 rounded-xl p-4">
-                      <div className="font-black uppercase text-gray-500 mb-2">2) Delay (Date Slip)</div>
-                      <div className="flex justify-between gap-3"><span className="font-bold text-gray-500">Start Delay</span><span className="font-black text-black">{formula.startDelay === null ? '-' : (formula.startDelay > 0 ? `+${formula.startDelay}` : `${formula.startDelay}`)} days</span></div>
-                      <div className="flex justify-between gap-3 mt-1"><span className="font-bold text-gray-500">Finish Delay</span><span className="font-black text-black">{formula.finishDelay === null ? '-' : (formula.finishDelay > 0 ? `+${formula.finishDelay}` : `${formula.finishDelay}`)} days</span></div>
-                    </div>
-                    <div className="bg-gray-50 border border-gray-200 rounded-xl p-4">
-                      <div className="font-black uppercase text-gray-500 mb-2">3) Progress Status (As on {asOnDate})</div>
-                      <div className="flex justify-between gap-3"><span className="font-bold text-gray-500">Planned Qty</span><span className="font-black text-black">{formula.plannedQty} {formula.unit}</span></div>
-                      <div className="flex justify-between gap-3 mt-1"><span className="font-bold text-gray-500">Actual Completed</span><span className="font-black text-black">{formula.actualQty} {formula.unit}</span></div>
-                      <div className="flex justify-between gap-3 mt-2 pt-2 border-t border-gray-200"><span className="font-bold text-gray-500">Planned %</span><span className="font-black text-black">{formula.plannedPctAsOn === null ? '-' : `${round2(formula.plannedPctAsOn)}%`}</span></div>
-                      <div className="flex justify-between gap-3 mt-1"><span className="font-bold text-gray-500">Actual %</span><span className="font-black text-black">{formula.actualPct === null ? '-' : `${round2(formula.actualPct)}%`}</span></div>
-                      <div className="flex justify-between gap-3 mt-2 pt-2 border-t border-gray-200"><span className="font-bold text-gray-500">Shortfall</span><span className="font-black">{formula.shortfall === null ? '-' : `${round2(formula.shortfall)} ${formula.unit}`}</span></div>
-                    </div>
-                    <div className="bg-gray-50 border border-gray-200 rounded-xl p-4">
-                      <div className="font-black uppercase text-gray-500 mb-2">4) Performance Numbers</div>
-                      <div className="flex justify-between gap-3"><span className="font-bold text-gray-500">Planned Rate</span><span className="font-black text-black">{formula.plannedRate === null ? '-' : `${round2(formula.plannedRate)} /day`}</span></div>
-                      <div className="flex justify-between gap-3 mt-1"><span className="font-bold text-gray-500">Actual Rate</span><span className="font-black text-black">{formula.actualRate === null ? '-' : `${round2(formula.actualRate)} /day`}</span></div>
-                      <div className="flex justify-between gap-3 mt-2 pt-2 border-t border-gray-200"><span className="font-bold text-gray-500">Schedule Var (Qty)</span><span className="font-black text-black">{formula.scheduleVarianceQty === null ? '-' : `${round2(formula.scheduleVarianceQty)} ${formula.unit}`}</span></div>
-                      <div className="flex justify-between gap-3 mt-1"><span className="font-black text-black">{formula.spi === null ? '-' : round2(formula.spi)}</span></div>
-                    </div>
-                  </div>
-                ) : <div className="text-xs font-bold text-gray-500">Select an activity to see calculations.</div>}
-              </div>
+              
 
               <div className="bg-gray-50 p-6 rounded-2xl border-2 border-gray-200">
                 <h4 className="font-black text-black uppercase mb-8 flex items-center gap-2 border-b-2 border-gray-300 pb-3"><Users size={20} /> Manpower Entries</h4>
+                <datalist id="mp-name-suggestions">
+                  {mpTemplates.map(t => (
+                    <option key={t.nameKey} value={t.name} />
+                  ))}
+                </datalist>
+                <datalist id="mp-trade-suggestions">
+                  {Array.from(new Set(mpTemplates.map(t => String(t.trade || '').trim()).filter(Boolean))).map(v => (
+                    <option key={v} value={v} />
+                  ))}
+                </datalist>
+
                 <div className="space-y-10">
                   {act.manpower.map(item => (
                     <div key={item.id} className="bg-white border-2 border-black rounded-xl p-6 shadow-sm flex flex-col">
                       <InputGroup label="Manpower Code"><input className="w-full border-b-2 border-black font-mono font-bold p-2 bg-gray-50 uppercase" value={item.code} onChange={e => updateItemInActivity('manpower', item.id, 'code', e.target.value)} onBlur={e => handleResourceCodeBlur('manpower', item.id, e.target.value)} /></InputGroup>
-                      <InputGroup label="Name"><input className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.name} onChange={e => updateItemInActivity('manpower', item.id, 'name', e.target.value)} /></InputGroup>
-                      <InputGroup label="Trade"><input className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.trade} onChange={e => updateItemInActivity('manpower', item.id, 'trade', e.target.value)} /></InputGroup>
-                      <InputGroup label="Regular Hrs"><input type="number" className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.quantity} onChange={e => updateItemInActivity('manpower', item.id, 'quantity', parseFloat(e.target.value))} /></InputGroup>
-                      <InputGroup label="Overtime"><input type="number" className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.overtime || ''} onChange={e => updateItemInActivity('manpower', item.id, 'overtime', parseFloat(e.target.value))} /></InputGroup>
-                      <InputGroup label="Unit"><input className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.unit} onChange={e => updateItemInActivity('manpower', item.id, 'unit', e.target.value)} /></InputGroup>
-                      <InputGroup label="Cost (Opt)"><input type="number" className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.cost || ''} onChange={e => updateItemInActivity('manpower', item.id, 'cost', parseFloat(e.target.value))} /></InputGroup>
+                      <InputGroup label="Name"><input list="mp-name-suggestions" className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.name} onChange={e => updateItemInActivity('manpower', item.id, 'name', e.target.value)} onBlur={() => handleManpowerNameBlur(item.id, item)} /></InputGroup>
+                      <InputGroup label="Trade"><input list="mp-trade-suggestions" className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.trade} onChange={e => updateItemInActivity('manpower', item.id, 'trade', e.target.value)} onBlur={() => queueSaveManpowerTemplate(item)} /></InputGroup>
+                      <InputGroup label="Regular Hrs"><input type="number" className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.quantity} onChange={e => updateItemInActivity('manpower', item.id, 'quantity', parseFloat(e.target.value))} onBlur={() => queueSaveManpowerTemplate(item)} /></InputGroup>
+                      <InputGroup label="Overtime"><input type="number" className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.overtime || ''} onChange={e => updateItemInActivity('manpower', item.id, 'overtime', parseFloat(e.target.value))} onBlur={() => queueSaveManpowerTemplate(item)} /></InputGroup>
+                      <InputGroup label="Unit"><input className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.unit} onChange={e => updateItemInActivity('manpower', item.id, 'unit', e.target.value)} onBlur={() => queueSaveManpowerTemplate(item)} /></InputGroup>
+                      <InputGroup label="Cost (Opt)"><input type="number" className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.cost || ''} onChange={e => updateItemInActivity('manpower', item.id, 'cost', parseFloat(e.target.value))} onBlur={() => queueSaveManpowerTemplate(item)} /></InputGroup>
                       <InputGroup label="Site Notes"><textarea className="w-full text-sm italic p-2 border-2 border-gray-100 rounded-lg min-h-[60px]" value={item.comments} onChange={e => updateItemInActivity('manpower', item.id, 'comments', e.target.value)} /></InputGroup>
                       <button onClick={() => deleteItemFromActivity('manpower', item.id)} className="self-end text-red-600 mt-2 p-2 border-2 border-red-100 rounded-lg hover:bg-red-50"><Trash2 size={18} /></button>
                     </div>
@@ -1013,6 +1160,54 @@ export const EntryForm: React.FC<EntryFormProps> = ({ existingReport, onSave, on
                 <button onClick={() => addItemToActivity('subcontractor')} className="w-full mt-10 py-4 border-2 border-black border-dashed rounded-xl font-black uppercase text-xs hover:bg-black hover:text-white transition-all">+ Add Subcon</button>
               </div>
 
+              
+
+              <div className="bg-white p-6 rounded-2xl border-2 border-black shadow-sm">
+                <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 mb-4">
+                  <div>
+                    <h3 className="font-black uppercase text-lg tracking-tight">Schedule & Delay Calculator</h3>
+                    <p className="text-xs font-bold text-gray-500">Auto-calculated (Dates are Inclusive)</p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-black uppercase text-gray-500">As on</span>
+                    <input type="date" value={asOnDate} onChange={(e) => setAsOnDate(e.target.value)} className="font-bold p-2 rounded-lg border-2 border-black outline-none bg-white text-xs" />
+                  </div>
+                </div>
+
+                {formula ? (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+                    <div className="bg-gray-50 border border-gray-200 rounded-xl p-4">
+                      <div className="font-black uppercase text-gray-500 mb-2">1) Planned vs Actual Durations</div>
+                      <div className="flex justify-between gap-3"><span className="font-bold text-gray-500">Planned Duration</span><span className="font-black text-black">{formula.plannedDur ?? '-'} days</span></div>
+                      <div className="flex justify-between gap-3 mt-1"><span className="font-bold text-gray-500">Actual Duration</span><span className="font-black text-black">{formula.actualDurFull ?? formula.actualDurToDate ?? '-'} days {!formula.actualDurFull && formula.actualDurToDate ? '(to-date)' : ''}</span></div>
+                      <div className="flex justify-between gap-3 mt-2 pt-2 border-t border-gray-200"><span className="font-bold text-gray-500">Duration Variance</span><span className="font-black">{formula.durationVariance === null ? '-' : (formula.durationVariance > 0 ? `+${formula.durationVariance}` : `${formula.durationVariance}`)} days</span></div>
+                    </div>
+                    <div className="bg-gray-50 border border-gray-200 rounded-xl p-4">
+                      <div className="font-black uppercase text-gray-500 mb-2">2) Delay (Date Slip)</div>
+                      <div className="flex justify-between gap-3"><span className="font-bold text-gray-500">Start Delay</span><span className="font-black text-black">{formula.startDelay === null ? '-' : (formula.startDelay > 0 ? `+${formula.startDelay}` : `${formula.startDelay}`)} days</span></div>
+                      <div className="flex justify-between gap-3 mt-1"><span className="font-bold text-gray-500">Finish Delay</span><span className="font-black text-black">{formula.finishDelay === null ? '-' : (formula.finishDelay > 0 ? `+${formula.finishDelay}` : `${formula.finishDelay}`)} days</span></div>
+                    </div>
+                    <div className="bg-gray-50 border border-gray-200 rounded-xl p-4">
+                      <div className="font-black uppercase text-gray-500 mb-2">3) Progress Status (As on {asOnDate})</div>
+                      <div className="flex justify-between gap-3"><span className="font-bold text-gray-500">Planned Qty</span><span className="font-black text-black">{formula.plannedQty} {formula.unit}</span></div>
+                      <div className="flex justify-between gap-3 mt-1"><span className="font-bold text-gray-500">Actual Completed</span><span className="font-black text-black">{formula.actualQty} {formula.unit}</span></div>
+                      <div className="flex justify-between gap-3 mt-2 pt-2 border-t border-gray-200"><span className="font-bold text-gray-500">Planned %</span><span className="font-black text-black">{formula.plannedPctAsOn === null ? '-' : `${round2(formula.plannedPctAsOn)}%`}</span></div>
+                      <div className="flex justify-between gap-3 mt-1"><span className="font-bold text-gray-500">Actual %</span><span className="font-black text-black">{formula.actualPct === null ? '-' : `${round2(formula.actualPct)}%`}</span></div>
+                      <div className="flex justify-between gap-3 mt-2 pt-2 border-t border-gray-200"><span className="font-bold text-gray-500">Shortfall</span><span className="font-black">{formula.shortfall === null ? '-' : `${round2(formula.shortfall)} ${formula.unit}`}</span></div>
+                    </div>
+                    <div className="bg-gray-50 border border-gray-200 rounded-xl p-4">
+                      <div className="font-black uppercase text-gray-500 mb-2">4) Performance Numbers</div>
+                      <div className="flex justify-between gap-3"><span className="font-bold text-gray-500">Planned Rate</span><span className="font-black text-black">{formula.plannedRate === null ? '-' : `${round2(formula.plannedRate)} /day`}</span></div>
+                      <div className="flex justify-between gap-3 mt-1"><span className="font-bold text-gray-500">Actual Rate</span><span className="font-black text-black">{formula.actualRate === null ? '-' : `${round2(formula.actualRate)} /day`}</span></div>
+                      <div className="flex justify-between gap-3 mt-2 pt-2 border-t border-gray-200"><span className="font-bold text-gray-500">Schedule Var (Qty)</span><span className="font-black text-black">{formula.scheduleVarianceQty === null ? '-' : `${round2(formula.scheduleVarianceQty)} ${formula.unit}`}</span></div>
+                      <div className="flex justify-between gap-3 mt-1"><span className="font-bold text-gray-500">CPI</span><span className="font-black text-black">{formula.cpi === null ? '-' : round2(formula.cpi)}</span></div>
+<div className="flex justify-between gap-3 mt-1"><span className="font-bold text-gray-500">SPI</span><span className="font-black text-black">{formula.spi === null ? '-' : round2(formula.spi)}</span></div>
+                      <div className="flex justify-between gap-3 mt-1"><span className="font-bold text-gray-500">Performance %</span><span className="font-black text-black">{formula.performancePct === null ? '-' : `${round2(formula.performancePct)}%`}</span></div>
+                    </div>
+                  </div>
+                ) : <div className="text-xs font-bold text-gray-500">Select an activity to see calculations.</div>}
+              </div>
+
               {/* UPGRADED RISK REGISTER SECTION */}
               <div className="bg-red-50 p-6 rounded-2xl border-2 border-red-200">
                 <div className="flex justify-between items-start mb-6">
@@ -1067,7 +1262,7 @@ export const EntryForm: React.FC<EntryFormProps> = ({ existingReport, onSave, on
                 </div>
 
                 <div className="space-y-10">
-                  {act.risks.map(r => (
+                  {(act?.risks ?? []).map(r => (
                     <div key={r.id} className="bg-white border-2 border-red-900 rounded-xl p-6 shadow-sm flex flex-col relative overflow-hidden">
                       <div className="absolute top-0 right-0 bg-red-900 text-white px-3 py-1 text-[9px] font-black uppercase">Active Risk Threat</div>
                       <InputGroup label="Risk ID"><input className="w-full border-b-2 border-red-900 font-mono font-bold p-2 bg-red-50/20 uppercase" value={r.code} onChange={e => updateRiskInActivity(r.id, 'code', e.target.value)} onBlur={e => handleResourceCodeBlur('risk', r.id, e.target.value)} /></InputGroup>
