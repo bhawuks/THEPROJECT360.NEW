@@ -3,7 +3,7 @@ import { BaseEntry, DailyReport, RiskEntry, RiskImpact, RiskLikelihood, RiskStat
 import { UNITS, RISK_IMPACTS, RISK_LIKELIHOODS, RISK_STATUSES } from '../constants';
 import { Trash2, Plus, Save, ChevronLeft, ChevronDown, ChevronUp, Copy, CheckCircle2, Flag, AlertTriangle, Users, Package, Truck, Briefcase, LayoutList, Check, Calendar as CalendarIcon, ArrowLeft, X, TrendingDown, TrendingUp, DollarSign } from 'lucide-react';
 import { db } from '../services/firebaseService';
-import { doc, getDoc, setDoc, collection, getDocs, query, where, writeBatch, orderBy, limit } from 'firebase/firestore';
+import { doc, getDoc, setDoc, collection, getDocs, query, where, writeBatch, orderBy, limit, onSnapshot } from 'firebase/firestore';
 
 
 // ✅ DND-KIT (Sortable list)
@@ -93,6 +93,44 @@ const emptyResourceMemory = (): ResourceMemory => ({
   subcontractor: {},
   risk: {}
 });
+
+// ------------------------------------------------------------------
+// ✅ MASTER DATA (Firestore) ➜ EntryForm auto-fill (no manual sync)
+// ------------------------------------------------------------------
+type MasterCategoryLite = 'manpower' | 'material' | 'equipment' | 'subcontractor';
+
+type MasterRow = {
+  code: string;
+  name: string;
+  unit?: string;
+  quantity?: number;     // MasterData: Manpower = Regular Hours
+  overtime?: number;
+  trade?: string;
+  company?: string;
+  cost?: number;
+  comments?: string;
+  updatedAt?: number;
+  [key: string]: any;
+};
+
+type MasterIndex = Record<MasterCategoryLite, {
+  byCode: Record<string, MasterRow>;
+  byName: Record<string, MasterRow>;
+}>;
+
+const MASTER_COLLECTIONS: Record<MasterCategoryLite, string> = {
+  manpower: 'master_manpower',
+  material: 'master_material',
+  equipment: 'master_equipment',
+  subcontractor: 'master_subcontractor',
+};
+
+const upper = (v: any) => String(v ?? '').trim().toUpperCase();
+
+// ------------------------------------------------------------------
+// ✅ MASTER DATA LIVE SYNC (MasterData ➜ EntryForm)
+// ------------------------------------------------------------------
+
 
 const StorageService = {
   async getReportByDate(userId: string, date: string): Promise<DailyReport | null> {
@@ -476,6 +514,14 @@ export const EntryForm: React.FC<EntryFormProps> = ({ existingReport, onSave, on
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [resourceMemory, setResourceMemory] = useState<ResourceMemory>(emptyResourceMemory());
 
+  // ✅ Live MasterData index (code/name ➜ template) so EntryForm auto-fills instantly
+  const [masterIndex, setMasterIndex] = useState<MasterIndex>(() => ({
+    manpower: { byCode: {}, byName: {} },
+    material: { byCode: {}, byName: {} },
+    equipment: { byCode: {}, byName: {} },
+    subcontractor: { byCode: {}, byName: {} },
+  }));
+
   const [mpTemplates, setMpTemplates] = useState<ManpowerTemplate[]>([]);
   const mpTemplateMap = useMemo(() => new Map(mpTemplates.map(t => [t.nameKey, t] as const)), [mpTemplates]);
   const mpSaveTimerRef = useRef<number | null>(null);
@@ -534,6 +580,49 @@ export const EntryForm: React.FC<EntryFormProps> = ({ existingReport, onSave, on
       }
     })();
     return () => { cancelled = true; };
+  }, [currentUserId]);
+
+  // ✅ Live MasterData listeners (so new MasterData rows auto-fill in EntryForm)
+  useEffect(() => {
+    if (!currentUserId) return;
+    const unsubs: Array<() => void> = [];
+
+    (Object.keys(MASTER_COLLECTIONS) as MasterCategoryLite[]).forEach((cat) => {
+      const colName = MASTER_COLLECTIONS[cat];
+      const colRef = collection(db, 'users', currentUserId, colName);
+
+      const unsub = onSnapshot(colRef, (snap) => {
+        const byCode: Record<string, MasterRow> = {};
+        const byName: Record<string, MasterRow> = {};
+
+        snap.docs.forEach((d) => {
+          const data: any = d.data() || {};
+          const code = upper(data.code || d.id);
+          const name = String(data.name || '').trim();
+          if (!code || !name) return;
+          const row: MasterRow = {
+            ...data,
+            code,
+            name,
+          };
+          byCode[code] = row;
+          byName[normalizeKey(name)] = row;
+        });
+
+        setMasterIndex((prev) => ({
+          ...prev,
+          [cat]: { byCode, byName },
+        }));
+      });
+
+      unsubs.push(unsub);
+    });
+
+    return () => {
+      unsubs.forEach((u) => {
+        try { u(); } catch { /* noop */ }
+      });
+    };
   }, [currentUserId]);
 
   // ✅ Load manpower templates (Name-based smart memory) from Firestore
@@ -713,17 +802,83 @@ export const EntryForm: React.FC<EntryFormProps> = ({ existingReport, onSave, on
     requestAnimationFrame(() => {
       if (!code) return;
       const upperCode = code.toUpperCase();
-      const mem = resourceMemory[category][upperCode];
+      const mem: any =
+        (resourceMemory as any)?.[category]?.[upperCode] ||
+        (category !== 'risk' ? (masterIndex as any)?.[category]?.byCode?.[upperCode] : undefined);
       if (mem) {
         if (category === 'risk') {
           setActivities(prev => prev.map(a => a.id === selectedActivityId ? { ...a, risks: a.risks.map(r => r.id === itemId ? { ...r, description: mem.description || r.description, likelihood: (mem.likelihood as RiskLikelihood) || r.likelihood, impact: (mem.impact as RiskImpact) || r.impact, status: (mem.status as RiskStatus) || r.status, mitigation: mem.mitigation || r.mitigation, code: upperCode } : r) } : a));
         } else {
-          setActivities(prev => prev.map(a => a.id === selectedActivityId ? { ...a, [category]: (a[category as EntryCategory] as BaseEntry[]).map(i => i.id === itemId ? { ...i, name: mem.name || i.name, unit: mem.unit || i.unit, cost: mem.cost !== undefined ? mem.cost : i.cost, trade: mem.trade || i.trade, company: mem.company || i.company, quantity: mem.quantity || i.quantity, comments: mem.comments || i.comments, code: upperCode } : i) } : a));
+          setActivities(prev => prev.map(a => a.id === selectedActivityId ? {
+            ...a,
+            [category]: (a[category as EntryCategory] as BaseEntry[]).map(i => {
+              if (i.id !== itemId) return i;
+              return {
+                ...i,
+                code: upperCode,
+                name: (mem.name ?? i.name),
+                unit: (mem.unit ?? i.unit),
+                trade: (mem.trade ?? i.trade),
+                company: (mem.company ?? i.company),
+                quantity: (mem.quantity !== undefined ? mem.quantity : (mem.regularHours !== undefined ? mem.regularHours : i.quantity)),
+                overtime: (mem.overtime !== undefined ? mem.overtime : i.overtime),
+                cost: (mem.cost !== undefined ? mem.cost : i.cost),
+                comments: (mem.comments ?? i.comments),
+              };
+            })
+          } : a));
         }
         setToastMessage("Smart memory applied.");
       }
     });
   };
+
+  // ✅ MasterData autofill by NAME (user types Name ➜ fill Code/Unit/Trade/Hours/OT/Cost)
+  const applyMasterByName = useCallback((category: MasterCategoryLite, itemId: string, rawName: string) => {
+    const nameKey = normalizeKey(rawName);
+    if (!nameKey) return;
+    const master = masterIndex[category]?.byName?.[nameKey];
+    if (!master) return;
+
+    const masterCode = upper(master.code);
+
+    setActivities((prev) =>
+      prev.map((a) => {
+        if (a.id !== selectedActivityId) return a;
+        const list = (a[category as EntryCategory] as BaseEntry[]) || [];
+        return {
+          ...a,
+          [category]: list.map((i) => {
+            if (i.id !== itemId) return i;
+            const next: any = { ...i };
+
+            // Code should come from MasterData when user typed Name
+            if (!String(next.code || '').trim() && masterCode) next.code = masterCode;
+
+            if (!String(next.unit || '').trim() && master.unit) next.unit = master.unit;
+            if (!String(next.comments || '').trim() && master.comments) next.comments = master.comments;
+            if ((next.cost === undefined || next.cost === '' || numOr(next.cost, 0) === 0) && master.cost !== undefined) next.cost = master.cost;
+
+            // Regular hours (quantity) + OT for manpower
+            if (category === 'manpower') {
+              if (!String(next.trade || '').trim() && master.trade) next.trade = master.trade;
+              if (!numOr(next.quantity, 0) && master.quantity !== undefined) next.quantity = master.quantity;
+              if (!numOr(next.overtime, 0) && master.overtime !== undefined) next.overtime = master.overtime;
+            }
+
+            if (category === 'subcontractor') {
+              if (!String(next.company || '').trim() && master.company) next.company = master.company;
+              if (!numOr(next.quantity, 0) && master.quantity !== undefined) next.quantity = master.quantity;
+            }
+
+            return next;
+          }),
+        };
+      })
+    );
+
+    setToastMessage('Master data applied.');
+  }, [masterIndex, selectedActivityId]);
   
 
   // ------------------------------------------------------------------
@@ -796,6 +951,9 @@ export const EntryForm: React.FC<EntryFormProps> = ({ existingReport, onSave, on
   }, [mpTemplateMap, selectedActivityId]);
 
   const handleManpowerNameBlur = useCallback((itemId: string, row: any) => {
+    // First: if this Name exists in MasterData, apply it (Code/Trade/Unit/Hours/OT/Cost)
+    applyMasterByName('manpower', itemId, row?.name || '');
+
     // Apply from existing template first (if any)
     applyManpowerTemplate(itemId, row?.name || "");
 
@@ -806,7 +964,7 @@ export const EntryForm: React.FC<EntryFormProps> = ({ existingReport, onSave, on
       trade: toTitleCase(String(row?.trade || "")),
       unit: normalizeUnit(String(row?.unit || "")),
     });
-  }, [applyManpowerTemplate, queueSaveManpowerTemplate]);
+  }, [applyMasterByName, applyManpowerTemplate, queueSaveManpowerTemplate]);
 
 const deleteItemFromActivity = (category: EntryCategory, itemId: string) => {
     const key = category as keyof ActivityEntry;
@@ -824,17 +982,45 @@ const deleteItemFromActivity = (category: EntryCategory, itemId: string) => {
 
   const handleSave = async () => {
     const report: DailyReport = { id: reportId, userId: currentUserId, createdAt: existingReport?.createdAt || Date.now(), updatedAt: Date.now(), date, activities };
-    const newMemory = { ...resourceMemory };
+    const newMemory: ResourceMemory = {
+      ...resourceMemory,
+      manpower: { ...(resourceMemory as any).manpower },
+      material: { ...(resourceMemory as any).material },
+      equipment: { ...(resourceMemory as any).equipment },
+      subcontractor: { ...(resourceMemory as any).subcontractor },
+      risk: { ...(resourceMemory as any).risk },
+    } as ResourceMemory;
+
     activities.forEach(act => {
-      act.manpower.forEach(m => { if (m.code) newMemory.manpower[m.code] = { name: m.name, trade: m.trade, unit: m.unit, cost: m.cost, quantity: m.quantity, comments: m.comments }; });
-      act.material.forEach(m => { if (m.code) newMemory.material[m.code] = { name: m.name, unit: m.unit, cost: m.cost, quantity: m.quantity, comments: m.comments }; });
-      act.equipment.forEach(m => { if (m.code) newMemory.equipment[m.code] = { name: m.name, unit: m.unit, cost: m.cost, quantity: m.quantity, comments: m.comments }; });
-      act.subcontractor.forEach(m => { if (m.code) newMemory.subcontractor[m.code] = { name: m.name, company: m.company, unit: m.unit, cost: m.cost, quantity: m.quantity, comments: m.comments }; });
-      act.risks.forEach(r => { if (r.code) newMemory.risk[r.code] = { description: r.description, likelihood: r.likelihood, impact: r.impact, mitigation: r.mitigation, status: r.status }; });
+      act.manpower.forEach(m => {
+        const c = upper(m.code);
+        if (!c) return;
+        (newMemory.manpower as any)[c] = { name: m.name, trade: m.trade, unit: m.unit, cost: m.cost, quantity: m.quantity, overtime: (m as any).overtime, comments: m.comments };
+      });
+      act.material.forEach(m => {
+        const c = upper(m.code);
+        if (!c) return;
+        (newMemory.material as any)[c] = { name: m.name, unit: m.unit, cost: m.cost, quantity: m.quantity, comments: m.comments };
+      });
+      act.equipment.forEach(m => {
+        const c = upper(m.code);
+        if (!c) return;
+        (newMemory.equipment as any)[c] = { name: m.name, unit: m.unit, cost: m.cost, quantity: m.quantity, comments: m.comments };
+      });
+      act.subcontractor.forEach(m => {
+        const c = upper(m.code);
+        if (!c) return;
+        (newMemory.subcontractor as any)[c] = { name: m.name, company: (m as any).company, unit: m.unit, cost: m.cost, quantity: m.quantity, comments: m.comments };
+      });
+      act.risks.forEach(r => {
+        const c = upper(r.code);
+        if (!c) return;
+        (newMemory.risk as any)[c] = { description: r.description, likelihood: r.likelihood, impact: r.impact, mitigation: r.mitigation, status: r.status };
+      });
     });
     setResourceMemory(newMemory);
     await StorageService.saveResourceMemory(currentUserId, newMemory);
-    await await StorageService.saveReport(report);
+    await StorageService.saveReport(report);
     onSave(report);
     window.scrollTo({ top: 0, behavior: 'smooth' });
     setShowSavedDialog(true);
@@ -1111,7 +1297,7 @@ const deleteItemFromActivity = (category: EntryCategory, itemId: string) => {
                   {act.material.map(item => (
                     <div key={item.id} className="bg-white border-2 border-black rounded-xl p-6 shadow-sm flex flex-col">
                       <InputGroup label="Material Code"><input className="w-full border-b-2 border-black font-mono font-bold p-2 bg-gray-50 uppercase" value={item.code} onChange={e => updateItemInActivity('material', item.id, 'code', e.target.value)} onBlur={e => handleResourceCodeBlur('material', item.id, e.target.value)} /></InputGroup>
-                      <InputGroup label="Description"><input className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.name} onChange={e => updateItemInActivity('material', item.id, 'name', e.target.value)} /></InputGroup>
+                      <InputGroup label="Description"><input className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.name} onChange={e => updateItemInActivity('material', item.id, 'name', e.target.value)} onBlur={() => applyMasterByName('material', item.id, item.name)} /></InputGroup>
                       <InputGroup label="Qty"><input type="number" className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.quantity} onChange={e => updateItemInActivity('material', item.id, 'quantity', parseFloat(e.target.value))} /></InputGroup>
                       <InputGroup label="Unit"><input className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.unit} onChange={e => updateItemInActivity('material', item.id, 'unit', e.target.value)} /></InputGroup>
                       <InputGroup label="Cost"><input type="number" className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.cost || ''} onChange={e => updateItemInActivity('material', item.id, 'cost', parseFloat(e.target.value))} /></InputGroup>
@@ -1129,7 +1315,7 @@ const deleteItemFromActivity = (category: EntryCategory, itemId: string) => {
                   {act.equipment.map(item => (
                     <div key={item.id} className="bg-white border-2 border-black rounded-xl p-6 shadow-sm flex flex-col">
                       <InputGroup label="Equipment Code"><input className="w-full border-b-2 border-black font-mono font-bold p-2 bg-gray-50 uppercase" value={item.code} onChange={e => updateItemInActivity('equipment', item.id, 'code', e.target.value)} onBlur={e => handleResourceCodeBlur('equipment', item.id, e.target.value)} /></InputGroup>
-                      <InputGroup label="Description"><input className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.name} onChange={e => updateItemInActivity('equipment', item.id, 'name', e.target.value)} /></InputGroup>
+                      <InputGroup label="Description"><input className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.name} onChange={e => updateItemInActivity('equipment', item.id, 'name', e.target.value)} onBlur={() => applyMasterByName('equipment', item.id, item.name)} /></InputGroup>
                       <InputGroup label="Operating Hrs"><input type="number" className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.quantity} onChange={e => updateItemInActivity('equipment', item.id, 'quantity', parseFloat(e.target.value))} /></InputGroup>
                       <InputGroup label="Unit"><input className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.unit} onChange={e => updateItemInActivity('equipment', item.id, 'unit', e.target.value)} /></InputGroup>
                       <InputGroup label="Hourly Rate"><input type="number" className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.cost || ''} onChange={e => updateItemInActivity('equipment', item.id, 'cost', parseFloat(e.target.value))} /></InputGroup>
@@ -1147,7 +1333,7 @@ const deleteItemFromActivity = (category: EntryCategory, itemId: string) => {
                   {act.subcontractor.map(item => (
                     <div key={item.id} className="bg-white border-2 border-black rounded-xl p-6 shadow-sm flex flex-col">
                       <InputGroup label="Ref Code"><input className="w-full border-b-2 border-black font-mono font-bold p-2 bg-gray-50 uppercase" value={item.code} onChange={e => updateItemInActivity('subcontractor', item.id, 'code', e.target.value)} onBlur={e => handleResourceCodeBlur('subcontractor', item.id, e.target.value)} /></InputGroup>
-                      <InputGroup label="Service Rendered"><input className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.name} onChange={e => updateItemInActivity('subcontractor', item.id, 'name', e.target.value)} /></InputGroup>
+                      <InputGroup label="Service Rendered"><input className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.name} onChange={e => updateItemInActivity('subcontractor', item.id, 'name', e.target.value)} onBlur={() => applyMasterByName('subcontractor', item.id, item.name)} /></InputGroup>
                       <InputGroup label="Company"><input className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.company} onChange={e => updateItemInActivity('subcontractor', item.id, 'company', e.target.value)} /></InputGroup>
                       <InputGroup label="Progress Qty"><input type="number" className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.quantity} onChange={e => updateItemInActivity('subcontractor', item.id, 'quantity', parseFloat(e.target.value))} /></InputGroup>
                       <InputGroup label="Unit"><input className="w-full border-b-2 border-gray-200 font-bold p-2" value={item.unit} onChange={e => updateItemInActivity('subcontractor', item.id, 'unit', e.target.value)} /></InputGroup>
