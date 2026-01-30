@@ -391,7 +391,9 @@ export const History: React.FC<HistoryProps> = ({ reports, onEdit }) => {
   };
 
   const fmtReportDate = (raw: string) => {
-    const d = new Date(raw);
+    // Avoid UTC shift for YYYY-MM-DD (it shows previous day in some timezones)
+    const isoDay = /^\\d{4}-\\d{2}-\\d{2}$/.test(raw);
+    const d = new Date(isoDay ? `${raw}T00:00:00` : raw);
     if (isNaN(d.getTime())) return raw;
     return d.toLocaleDateString(undefined, { day: '2-digit', month: 'short', year: 'numeric' });
   };

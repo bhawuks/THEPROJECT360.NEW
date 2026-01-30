@@ -3,9 +3,7 @@ import { onAuthStateChanged, signOut } from 'firebase/auth';
 import { auth } from './services/firebaseService';
 import { DailyReport, User, ViewState } from './types';
 import {
-  addUser,
-  saveReport,
-  getReports,
+  addUser,  getReports,
   deleteReport,
 } from './services/firestoreService';
 import { EntryForm } from './components/EntryForm';
@@ -75,9 +73,8 @@ const App: React.FC = () => {
   const handleSaveReport = async (report: DailyReport) => {
     if (!user) return;
     try {
-      await saveReport(user.id, report);
       await loadReports(user.id);
-      setView('history');
+      // stay on Entry Form after save
       setEditingReport(null);
       alert("Report saved successfully!");
     } catch (error) {
