@@ -84,7 +84,7 @@ Reports: ${JSON.stringify(reportData)}
       });
 
       const systemInstruction = `
-You are "SiteLog Assistant", an AI expert for a construction site management app called THEPROJECT 360.
+You are "Damodar", an AI expert for a construction site management app called THEPROJECT 360.
 
 Your Capabilities:
 1. You have access to the last 10 daily site reports provided in the context.

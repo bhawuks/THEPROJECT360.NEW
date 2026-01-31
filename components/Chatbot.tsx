@@ -20,7 +20,7 @@ export const Chatbot: React.FC<ChatbotProps> = ({ reports }) => {
     {
       id: 'welcome',
       role: 'model',
-      text: 'Hello! I am your SiteLog Assistant. I can analyze your project reports. Ask me about manpower, risks, or progress trends.',
+      text: 'Hello! I am your Damodar AI Assistant. I can analyze your project reports. Ask me about manpower, risks, or progress trends.',
       timestamp: Date.now()
     }
   ]);
@@ -163,7 +163,7 @@ export const Chatbot: React.FC<ChatbotProps> = ({ reports }) => {
                 <Bot size={20} />
               </div>
               <div>
-                <h3 className="font-black uppercase text-sm leading-none">SiteLog Assistant</h3>
+                <h3 className="font-black uppercase text-sm leading-none">Damodar</h3>
                 <span className="text-[10px] font-bold text-gray-400 uppercase">Powered by Gemini 3</span>
               </div>
             </div>
