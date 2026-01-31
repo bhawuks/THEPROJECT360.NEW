@@ -134,4 +134,4 @@ export interface User {
   email?: string | null;
 }
 
-export type ViewState = 'entry' | 'history' | 'milestones' | 'barchart';
+export type ViewState = 'entry' | 'history' | 'milestones' | 'barchart' | 'masterdata';

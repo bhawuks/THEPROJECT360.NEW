@@ -1,7 +1,6 @@
-// Fix: Use standard modular import for initializeApp and getAuth from Firebase v9 SDK.
-import { initializeApp } from 'firebase/app';
-import { getAuth, GoogleAuthProvider, signInWithPopup } from 'firebase/auth';
-import { getFirestore } from 'firebase/firestore';
+import { initializeApp, type FirebaseApp } from 'firebase/app';
+import { getAuth, GoogleAuthProvider, signInWithPopup, type Auth } from 'firebase/auth';
+import { getFirestore, type Firestore } from 'firebase/firestore';
 
 const firebaseConfig = {
   apiKey: "AIzaSyDTRO2GXMtWQHWJWdafaXT4XMalPN1tMtc",
@@ -12,18 +11,18 @@ const firebaseConfig = {
   appId: "1:419530683590:web:687135794c6dcbad1c13c7"
 };
 
-let app;
-let auth = null;
-let db = null;
+let app: FirebaseApp | null = null;
+let auth: Auth | null = null;
+let db: Firestore | null = null;
 
 try {
   app = initializeApp(firebaseConfig);
   auth = getAuth(app);
   db = getFirestore(app);
-  console.log("Firebase initialized successfully.");
+  console.log('Firebase initialized successfully.');
 } catch (error) {
   console.error(
-    "Firebase initialization failed. Please configure your firebase credentials in services/firebaseService.ts",
+    'Firebase initialization failed. Please configure your firebase credentials in services/firebaseService.ts',
     error
   );
 }
@@ -31,11 +30,8 @@ try {
 const provider = new GoogleAuthProvider();
 
 export const signInWithGoogle = () => {
-  if (auth) {
-    return signInWithPopup(auth, provider);
-  } else {
-    return Promise.reject("Firebase auth is not initialized.");
-  }
+  if (auth) return signInWithPopup(auth, provider);
+  return Promise.reject('Firebase auth is not initialized.');
 };
 
-export { auth, db };
+export { app, auth, db };

@@ -1,317 +1,326 @@
-// Firestore.ts
 import {
   collection,
-  doc,
-  setDoc,
-  getDocs,
   deleteDoc,
-  query,
-  where,
+  doc,
+  getDocs,
+  setDoc,
   getDoc,
-  writeBatch,
+  query,
+  orderBy,
+  limit
 } from "firebase/firestore";
 import { db } from "./firebaseService";
-import { DailyReport, User, ResourceMemory, ActivityEntry } from "../types";
 
-// Firestore returns untyped data sometimes; keep TS stable.
-const coerceActivities = (v: unknown): ActivityEntry[] =>
-  Array.isArray(v) ? (v as ActivityEntry[]) : [];
+// --- 1. CORE APP FUNCTIONS ---
 
-const emptyResourceMemory = (): ResourceMemory => ({
-  manpower: {},
-  material: {},
-  equipment: {},
-  subcontractor: {},
-  risk: {},
-});
-
-// ------------------------------------------------------------------
-// USERS
-// ------------------------------------------------------------------
-export const addUser = async (user: User) => {
-  if (!db) {
-    console.error("Firestore is not initialized.");
-    return;
-  }
+export const addUser = async (user: any) => {
+  if (!db) return;
   try {
-    const userRef = doc(db, "users", user.id);
+    const userId = user.uid || user.id;
+    if (!userId) return;
+    const userRef = doc(db, "users", userId);
     const docSnap = await getDoc(userRef);
-
     if (!docSnap.exists()) {
       await setDoc(userRef, {
+        username: user.displayName || user.email?.split('@')[0] || "User",
         email: user.email,
         createdAt: Date.now(),
       });
-      console.log("User added to Firestore");
     }
-    
-  } catch (e) {
-    console.error("Error adding user: ", e);
+  } catch (error) {
+    console.error("Error adding user:", error);
   }
 };
 
-// ------------------------------------------------------------------
-// REPORTS (Schema: users/{userId}/reports/{date})
-// - IMPORTANT: doc id is the date string (YYYY-MM-DD)
-// ------------------------------------------------------------------
-export const saveReport = async (userId: string, report: DailyReport) => {
-  if (!db) {
-    console.error("Firestore is not initialized.");
-    return;
-  }
+// ✅ RESTORES THE SAVE BUTTON
+export const saveReport = async (arg1: any, arg2?: any) => {
+  if (!db) throw new Error('Firestore db is not initialized.');
   try {
-    const reportRef = doc(db, "users", userId, "reports", report.date);
-    await setDoc(
-      reportRef,
-      {
-        ...report,
-        userId,
-        date: report.date,
-        activities: coerceActivities((report as any).activities),
-        updatedAt: Date.now(),
-      },
-      { merge: true }
-    );
-    console.log("Report saved successfully");
-  } catch (e) {
-    console.error("Error saving report: ", e);
-  }
-};
+    // Support BOTH call styles:
+    //   saveReport(userId, report)
+    //   saveReport(report)
+    const userId = typeof arg1 === 'string' ? arg1 : (arg1?.userId || arg2?.userId);
+    const report = typeof arg1 === 'string' ? arg2 : arg1;
 
-export const getReports = async (userId: string): Promise<DailyReport[]> => {
-  if (!db) {
-    console.error("Firestore is not initialized.");
-    return [];
-  }
-  try {
-    const reportsRef = collection(db, "users", userId, "reports");
-    const querySnapshot = await getDocs(reportsRef);
+    if (!userId) throw new Error('Missing userId');
+    if (!report?.date) throw new Error('Report missing date');
 
-    const reports: DailyReport[] = querySnapshot.docs.map((d) => {
-      const data = d.data() as DailyReport;
-      return {
-        ...data,
-        userId,
-        activities: coerceActivities((data as any).activities),
-      };
-    });
-
-    return reports;
-  } catch (e) {
-    console.error("Error getting reports: ", e);
-    return [];
-  }
-};
-
-export const deleteReport = async (userId: string, date: string) => {
-  if (!db) {
-    console.error("Firestore is not initialized.");
-    return;
-  }
-  try {
-    const reportRef = doc(db, "users", userId, "reports", date);
-    await deleteDoc(reportRef);
-    console.log("Report deleted successfully");
-  } catch (e) {
-    console.error("Error deleting report: ", e);
-  }
-};
-
-export const getReportByDate = async (
-  userId: string,
-  date: string
-): Promise<DailyReport | null> => {
-  if (!db) {
-    console.error("Firestore is not initialized.");
-    return null;
-  }
-  try {
-    // since doc id = date, direct read is best
-    const reportRef = doc(db, "users", userId, "reports", date);
-    const snap = await getDoc(reportRef);
-    if (!snap.exists()) return null;
-
-    const data = snap.data() as DailyReport;
-    return {
-      ...data,
+    // One report per DATE (date is the doc id)
+        const reportRef = doc(db, 'users', userId, 'reports', String(report.date));
+    // Firestore does not allow `undefined` anywhere in the object.
+    // Convert to plain JSON to strip undefined recursively.
+    const cleanedReport = JSON.parse(JSON.stringify({
+      ...report,
       userId,
-      date,
-      activities: coerceActivities((data as any).activities),
-    };
-  } catch (e) {
-    console.error("Error getting report by date: ", e);
-    return null;
+      id: String(report.date),
+    }));
+    await setDoc(reportRef, cleanedReport, { merge: true });
+  } catch (error) {
+    console.error('Error saving report:', error);
+    throw error;
   }
 };
 
-export const getReportsInRange = async (
-  userId: string,
-  startDate: string,
-  endDate: string
-): Promise<DailyReport[]> => {
-  if (!db) {
-    console.error("Firestore is not initialized.");
-    return [];
-  }
-  try {
-    const reportsRef = collection(db, "users", userId, "reports");
-    const qRef = query(
-      reportsRef,
-      where("date", ">=", startDate),
-      where("date", "<=", endDate)
-    );
-    const snaps = await getDocs(qRef);
 
-    return snaps.docs.map((d) => {
-      const data = d.data() as DailyReport;
-      return {
+
+export const getReports = async (userId: string): Promise<any[]> => {
+  if (!db) return [];
+  try {
+    if (!userId) return [];
+
+    const reportsRef = collection(db, "users", userId, "reports");
+    const snapshot = await getDocs(reportsRef);
+
+    // Normalize + de-duplicate by date (handles legacy docs saved under random IDs)
+    const byDate = new Map<string, any>();
+
+    for (const d of snapshot.docs) {
+      const data: any = d.data() || {};
+      const dateKey = String(data.date || d.id || "").trim();
+      if (!dateKey) continue;
+
+      const normalized = {
         ...data,
-        userId,
-        activities: coerceActivities((data as any).activities),
+        id: dateKey,
+        date: dateKey,
       };
-    });
-  } catch (e) {
-    console.error("Error getting reports in range: ", e);
+
+      const existing = byDate.get(dateKey);
+      if (!existing) {
+        byDate.set(dateKey, normalized);
+        continue;
+      }
+
+      // Merge: union activities by internal uid/id
+      const a1: any[] = Array.isArray(existing.activities) ? existing.activities : [];
+      const a2: any[] = Array.isArray(normalized.activities) ? normalized.activities : [];
+
+      const seen = new Set<string>();
+      const mergedActs: any[] = [];
+      for (const a of [...a1, ...a2]) {
+        const key = String(a?.uid || a?.id || a?.code || "");
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        mergedActs.push(a);
+      }
+
+      const existingUpdated = Number(existing.updatedAt || 0);
+      const incomingUpdated = Number(normalized.updatedAt || 0);
+      const winner = incomingUpdated >= existingUpdated ? normalized : existing;
+
+      byDate.set(dateKey, {
+        ...winner,
+        activities: mergedActs.length ? mergedActs : (winner.activities || []),
+        updatedAt: Math.max(existingUpdated, incomingUpdated),
+      });
+    }
+
+    const list = Array.from(byDate.values());
+    list.sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
+    return list;
+  } catch (error) {
+    console.error("Error getting reports:", error);
     return [];
   }
 };
 
-// ------------------------------------------------------------------
-// RESOURCE MEMORY (Schema: users/{userId}/resourceMemory/main)
-// ------------------------------------------------------------------
-export const getResourceMemory = async (
-  userId: string
-): Promise<ResourceMemory> => {
-  if (!db) {
-    console.error("Firestore is not initialized.");
-    return emptyResourceMemory();
-  }
+
+export const deleteReport = async (userId: string, reportId: string) => {
+  if (!db) return;
   try {
-    const memoryRef = doc(db, "users", userId, "resourceMemory", "main");
-    const snap = await getDoc(memoryRef);
-    if (snap.exists()) {
-      return snap.data() as ResourceMemory;
-    }
-    return emptyResourceMemory();
-  } catch (e) {
-    console.error("Error getting resource memory: ", e);
-    return emptyResourceMemory();
+    await deleteDoc(doc(db, "users", userId, "reports", reportId));
+  } catch (error) {
+    console.error("Error deleting report:", error);
+    throw error;
   }
 };
 
-export const saveResourceMemory = async (
-  userId: string,
-  memory: ResourceMemory
-) => {
-  if (!db) {
-    console.error("Firestore is not initialized.");
-    return;
-  }
-  try {
-    const memoryRef = doc(db, "users", userId, "resourceMemory", "main");
-    await setDoc(memoryRef, { ...memory, updatedAt: Date.now() } as any, {
-      merge: true,
-    });
-    console.log("Resource memory saved successfully");
-  } catch (e) {
-    console.error("Error saving resource memory: ", e);
-  }
+// --- 2. MASTER DATA LOGIC ---
+
+export type MasterCategory = "manpower" | "material" | "equipment" | "subcontractor" | "risk";
+
+export type MasterItem = {
+  code: string;
+  name: string;
+  unit?: string;
+  quantity?: number;     
+  overtime?: number;
+  trade?: string;        
+  company?: string;      
+  cost?: number;
+  comments?: string;
+  updatedAt?: number;
+  [key: string]: any;    
 };
 
-// ------------------------------------------------------------------
-// HISTORY HELPERS
-// ------------------------------------------------------------------
-export const findActivityInHistory = async (
-  userId: string,
-  activityId: string
-): Promise<boolean> => {
-  if (!db) {
-    console.error("Firestore is not initialized.");
-    return false;
+const MASTER_COLLECTION: Record<MasterCategory, string> = {
+  manpower: "master_manpower",
+  material: "master_material",
+  equipment: "master_equipment",
+  subcontractor: "master_subcontractor",
+  risk: "master_risk",
+};
+
+const normCode = (v: any) => String(v ?? "").trim().toUpperCase();
+const tidyName = (v: any) => String(v ?? "").trim();
+const normalizeKey = (s: string) => String(s || "").trim().replace(/\s+/g, " ").toLowerCase();
+
+function ensureDb() {
+  if (!db) throw new Error("Firestore db is not initialized.");
+}
+
+// ✅ SYNC TRANSLATOR: Now strictly maps 'quantity' to 'regularHours'
+async function syncItemToMemory(userId: string, category: MasterCategory, item: MasterItem) {
+  if (category === 'risk') return; 
+
+  const nameKey = normalizeKey(item.name);
+  if (!nameKey) return;
+
+  const memoryRef = doc(db, "users", userId, "resourceMemory", "main");
+
+  // Base Template
+  let template: any = {
+    nameKey,
+    name: item.name,
+    unit: item.unit || '',
+    cost: item.cost || 0,
+    updatedAt: Date.now(),
+  };
+
+  if (category === 'manpower') {
+    // We treat 'quantity' from MasterData as 'Regular Hours'
+    const hrs = item.quantity || 8;
+    
+    template = {
+      ...template,
+      trade: item.trade || '',
+      regularHours: hrs, // Standard for EntryForm
+      regularHrs: hrs,   // Backup name
+      overtime: item.overtime || 0,
+    };
+  } else if (category === 'subcontractor') {
+    template = {
+      ...template,
+      company: item.company || '',
+    };
+  } else if (category === 'material' || category === 'equipment') {
+    if (item.quantity) template.quantity = item.quantity;
   }
 
-  try {
-    const reportsRef = collection(db, "users", userId, "reports");
-    const snaps = await getDocs(reportsRef);
+  const updatePayload = {
+    [`${category}.${nameKey}`]: template
+  };
 
-    const target = String(activityId || "").toUpperCase();
-    for (const s of snaps.docs) {
-      const rep = s.data() as DailyReport;
-      const acts = coerceActivities((rep as any).activities);
-      if (acts.some((a) => String(a.activityId || "").toUpperCase() === target)) {
-        return true;
+  try {
+    await setDoc(memoryRef, updatePayload, { merge: true });
+  } catch (err) {
+    console.error("Error syncing to EntryForm memory:", err);
+  }
+}
+
+// ✅ SYNC ALL: Triggered by the button
+export async function syncAllMasterItemsToMemory(userId: string) {
+  ensureDb();
+  const categories: MasterCategory[] = ['manpower', 'material', 'equipment', 'subcontractor'];
+  const allData: Record<string, any> = {};
+  
+  for (const cat of categories) {
+    const items = await listMasterItems(userId, cat);
+    if (!allData[cat]) allData[cat] = {};
+    
+    items.forEach(item => {
+      const nameKey = normalizeKey(item.name);
+      if (!nameKey) return;
+      
+      let template: any = {
+        nameKey,
+        name: item.name,
+        unit: item.unit || '',
+        cost: item.cost || 0,
+        updatedAt: Date.now(),
+      };
+
+      if (cat === 'manpower') {
+        const hrs = item.quantity || 8;
+        template.trade = item.trade || '';
+        template.regularHours = hrs;
+        template.regularHrs = hrs;
+        template.overtime = item.overtime || 0;
+      } else if (cat === 'subcontractor') {
+        template.company = item.company || '';
+      } else {
+         if (item.quantity) template.quantity = item.quantity;
       }
-    }
-    return false;
-  } catch (e) {
-    console.error("Error finding activity in history: ", e);
-    return false;
-  }
-};
 
-// ------------------------------------------------------------------
-// RIPPLE SHIFT (used by EntryForm when activityId conflicts)
-// Shifts ALL activities with numeric part >= conflict upward by 1
-// across ALL reports for the user.
-// ------------------------------------------------------------------
-export const rippleShiftActivityIds = async (
-  userId: string,
-  activityId: string
-): Promise<void> => {
-  if (!db) {
-    console.error("Firestore is not initialized.");
-    return;
-  }
-
-  const match = String(activityId || "").match(/(.*?)(\d+)/);
-  if (!match) return;
-
-  const prefix = match[1] || "ACT-";
-  const conflictNum = parseInt(match[2], 10) || 0;
-
-  const getNum = (idStr: string) =>
-    parseInt(String(idStr).match(/\d+/)?.[0] || "0", 10);
-
-  try {
-    const reportsRef = collection(db, "users", userId, "reports");
-    const snaps = await getDocs(reportsRef);
-
-    const batch = writeBatch(db);
-    let touched = 0;
-
-    snaps.docs.forEach((docSnap) => {
-      const rep = docSnap.data() as DailyReport;
-      const acts = coerceActivities((rep as any).activities);
-      if (!acts.length) return;
-
-      let changed = false;
-
-      const newActs = acts.map((a) => {
-        const aId = String(a.activityId || "");
-        const n = getNum(aId);
-        const p = aId.match(/^[^\d]+/)?.[0] || prefix;
-
-        if (p.toUpperCase() === prefix.toUpperCase() && n >= conflictNum) {
-          changed = true;
-          const next = `${p}${String(n + 1).padStart(5, "0")}`;
-          return { ...a, activityId: next };
-        }
-        return a;
-      });
-
-      if (changed) {
-        const ref = doc(db, "users", userId, "reports", rep.date);
-        batch.set(
-          ref,
-          { ...rep, activities: newActs, updatedAt: Date.now() },
-          { merge: true }
-        );
-        touched += 1;
-      }
+      allData[cat][nameKey] = template;
     });
-
-    if (touched > 0) await batch.commit();
-  } catch (e) {
-    console.error("Error ripple shifting activity IDs: ", e);
   }
-};
+
+  const memoryRef = doc(db, "users", userId, "resourceMemory", "main");
+  await setDoc(memoryRef, allData, { merge: true });
+}
+
+export async function listMasterItems(
+  userId: string,
+  category: MasterCategory
+): Promise<MasterItem[]> {
+  ensureDb();
+  const colName = MASTER_COLLECTION[category];
+  const colRef = collection(db, "users", userId, colName);
+  const snapshot = await getDocs(colRef);
+  
+  return snapshot.docs
+    .map((d) => d.data() as MasterItem)
+    .map((x) => ({
+      ...x,
+      code: normCode(x.code),
+      name: tidyName(x.name),
+    }))
+    .sort((a, b) => a.code.localeCompare(b.code));
+}
+
+export async function saveMasterItem(
+  userId: string,
+  category: MasterCategory,
+  arg3: string | MasterItem, 
+  arg4?: MasterItem          
+): Promise<void> {
+  ensureDb();
+  let item: MasterItem;
+  if (typeof arg3 === 'string') {
+    if (!arg4) throw new Error("saveMasterItem: missing item argument");
+    item = arg4;
+    item.code = arg3; 
+  } else {
+    item = arg3;
+  }
+
+  const colName = MASTER_COLLECTION[category];
+  const code = normCode(item.code);
+  if (!code) throw new Error("saveMasterItem: item.code is required");
+
+  const ref = doc(db, "users", userId, colName, code);
+  
+  const dataToSave = {
+    ...item,
+    code,
+    name: tidyName(item.name),
+    updatedAt: Date.now(),
+  };
+
+  await setDoc(ref, dataToSave, { merge: true });
+  // Background Sync
+  syncItemToMemory(userId, category, dataToSave).catch(e => console.error("Background sync error", e));
+}
+
+export async function deleteMasterItem(
+  userId: string,
+  category: MasterCategory,
+  code: string
+): Promise<void> {
+  ensureDb();
+  const colName = MASTER_COLLECTION[category];
+  const upper = normCode(code);
+  if (!upper) return;
+  await deleteDoc(doc(db, "users", userId, colName, upper));
+}
