@@ -33,20 +33,34 @@ export const addUser = async (user: any) => {
 };
 
 // ✅ RESTORES THE SAVE BUTTON
-export const saveReport = async (userId: string, report: any) => {
-  if (!db) return;
+export const saveReport = async (arg1: any, arg2?: any) => {
+  if (!db) throw new Error('Firestore db is not initialized.');
   try {
-    if (!userId) throw new Error("Missing userId");
-    if (!report?.date) throw new Error("Report missing date");
+    // Support BOTH call styles:
+    //   saveReport(userId, report)
+    //   saveReport(report)
+    const userId = typeof arg1 === 'string' ? arg1 : (arg1?.userId || arg2?.userId);
+    const report = typeof arg1 === 'string' ? arg2 : arg1;
 
-    // Single source of truth: one report document per DATE
-    const reportRef = doc(db, "users", userId, "reports", String(report.date));
-    await setDoc(reportRef, { ...report, id: String(report.date) }, { merge: true });
+    if (!userId) throw new Error('Missing userId');
+    if (!report?.date) throw new Error('Report missing date');
+
+    // One report per DATE (date is the doc id)
+        const reportRef = doc(db, 'users', userId, 'reports', String(report.date));
+    // Firestore does not allow `undefined` anywhere in the object.
+    // Convert to plain JSON to strip undefined recursively.
+    const cleanedReport = JSON.parse(JSON.stringify({
+      ...report,
+      userId,
+      id: String(report.date),
+    }));
+    await setDoc(reportRef, cleanedReport, { merge: true });
   } catch (error) {
-    console.error("Error saving report:", error);
+    console.error('Error saving report:', error);
     throw error;
   }
 };
+
 
 
 export const getReports = async (userId: string): Promise<any[]> => {

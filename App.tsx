@@ -3,8 +3,10 @@ import { onAuthStateChanged, signOut } from 'firebase/auth';
 import { auth } from './services/firebaseService';
 import { DailyReport, User, ViewState } from './types';
 import {
-  addUser,  getReports,
+  addUser,
+  getReports,
   deleteReport,
+  saveReport,
 } from './services/firestoreService';
 import { EntryForm } from './components/EntryForm';
 import { History } from './components/History';
@@ -73,13 +75,16 @@ const App: React.FC = () => {
   const handleSaveReport = async (report: DailyReport) => {
     if (!user) return;
     try {
+      console.log('Saving report to Firestore:', { userId: user.id, date: report?.date });
+      await saveReport(user.id, report);
       await loadReports(user.id);
       // stay on Entry Form after save
       setEditingReport(null);
-      alert("Report saved successfully!");
-    } catch (error) {
+      alert('Report saved successfully!');
+    } catch (error: any) {
       console.error('Error saving report:', error);
-      alert('Failed to save report. Please try again.');
+      const msg = error?.message ? String(error.message) : String(error);
+      alert('Save failed: ' + msg);
     }
   };
 

@@ -127,59 +127,6 @@ const MASTER_COLLECTIONS: Record<MasterCategoryLite, string> = {
 
 const upper = (v: any) => String(v ?? '').trim().toUpperCase();
 
-// ------------------------------------------------------------------
-// ✅ MASTER DATA LIVE SYNC (MasterData ➜ EntryForm)
-// ------------------------------------------------------------------
-
-
-const stripUndefined = (value: any): any => {
-  if (Array.isArray(value)) return value.map(stripUndefined).filter(v => v !== undefined);
-  if (value && typeof value === 'object') {
-    const out: any = {};
-    Object.keys(value).forEach(k => {
-      const v = stripUndefined((value as any)[k]);
-      if (v !== undefined) out[k] = v;
-    });
-    return out;
-  }
-  return value === undefined ? undefined : value;
-};
-
-// Ensures we persist the full Activity object (not just resources) even when some fields are undefined.
-const sanitizeActivity = (a: any) => ({
-  id: String(a?.id || generateId()),
-  activityId: String(a?.activityId || ''),
-  order: Number.isFinite(Number(a?.order)) ? Number(a.order) : 0,
-
-  // core activity fields
-  description: String(a?.description ?? ''),
-  responsiblePerson: String(a?.responsiblePerson ?? ''),
-  workCategory: String(a?.workCategory ?? ''),
-  detailedDescription: String(a?.detailedDescription ?? ''),
-  referenceCode: String(a?.referenceCode ?? ''),
-  workArea: String(a?.workArea ?? ''),
-  stationGrid: String(a?.stationGrid ?? ''),
-
-  // schedule/progress fields
-  plannedCompletion: Number.isFinite(Number(a?.plannedCompletion)) ? Number(a.plannedCompletion) : 0,
-  plannedQuantity: Number.isFinite(Number(a?.plannedQuantity)) ? Number(a.plannedQuantity) : 0,
-  actualQuantity: Number.isFinite(Number(a?.actualQuantity)) ? Number(a.actualQuantity) : 0,
-  quantityUnit: String(a?.quantityUnit ?? ''),
-
-  plannedStart: String(a?.plannedStart ?? ''),
-  plannedFinish: String(a?.plannedFinish ?? ''),
-  actualStart: String(a?.actualStart ?? ''),
-  actualFinish: String(a?.actualFinish ?? ''),
-  isMilestone: Boolean(a?.isMilestone),
-
-  // resources
-  manpower: Array.isArray(a?.manpower) ? a.manpower : [],
-  material: Array.isArray(a?.material) ? a.material : [],
-  equipment: Array.isArray(a?.equipment) ? a.equipment : [],
-  subcontractor: Array.isArray(a?.subcontractor) ? a.subcontractor : [],
-  risks: Array.isArray(a?.risks) ? a.risks : [],
-});
-
 const StorageService = {
   async getReportByDate(userId: string, date: string): Promise<DailyReport | null> {
     const ref = doc(db, 'users', userId, 'reports', date);
@@ -188,9 +135,9 @@ const StorageService = {
   },
 
   async saveReport(report: DailyReport): Promise<void> {
+    if (!db) throw new Error('Firestore db is not initialized.');
     const ref = doc(db, 'users', report.userId, 'reports', report.date);
-    const clean = stripUndefined(report);
-    await setDoc(ref, clean, { merge: true });
+    await setDoc(ref, report, { merge: true });
   },
 
   async getReportsInRange(userId: string, startDate: string, endDate: string): Promise<DailyReport[]> {
@@ -208,8 +155,10 @@ const StorageService = {
 
   async saveResourceMemory(userId: string, mem: ResourceMemory): Promise<void> {
     const ref = doc(db, 'users', userId, 'resourceMemory', 'main');
-    const clean = stripUndefined(mem);
-    await setDoc(ref, clean, { merge: true });
+    // Firestore does not allow `undefined` values anywhere in the object.
+    // This removes undefined recursively (safe for our plain JSON memory object).
+    const cleaned = JSON.parse(JSON.stringify(mem));
+    return setDoc(ref, cleaned, { merge: true }) as any;
   },
 
   async findActivityHistory(userId: string, activityId: string): Promise<boolean> {
@@ -259,7 +208,7 @@ const StorageService = {
 
       if (changed) {
         const ref = doc(db, 'users', userId, 'reports', rep.date);
-        batch.set(ref, stripUndefined({ ...rep, activities: newActs, updatedAt: Date.now() }), { merge: true });
+        batch.set(ref, { ...rep, activities: newActs, updatedAt: Date.now() }, { merge: true });
         touched += 1;
       }
     });
@@ -852,9 +801,19 @@ export const EntryForm: React.FC<EntryFormProps> = ({ existingReport, onSave, on
     requestAnimationFrame(() => {
       if (!code) return;
       const upperCode = code.toUpperCase();
-      const mem: any =
-        (resourceMemory as any)?.[category]?.[upperCode] ||
-        (category !== 'risk' ? (masterIndex as any)?.[category]?.byCode?.[upperCode] : undefined);
+      const memFromMemory: any = (resourceMemory as any)?.[category]?.[upperCode];
+      const memFromMaster: any =
+        category !== 'risk' ? (masterIndex as any)?.[category]?.byCode?.[upperCode] : undefined;
+
+      // ✅ Prefer latest MasterData when it differs from old resourceMemory
+      const mem: any = (() => {
+        if (!memFromMaster && !memFromMemory) return undefined;
+        if (!memFromMaster) return memFromMemory;
+        if (!memFromMemory) return memFromMaster;
+        const mUpd = Number(memFromMaster.updatedAt || 0);
+        const rUpd = Number(memFromMemory.updatedAt || 0);
+        return mUpd >= rUpd ? memFromMaster : memFromMemory;
+      })();
       if (mem) {
         if (category === 'risk') {
           setActivities(prev => prev.map(a => a.id === selectedActivityId ? { ...a, risks: a.risks.map(r => r.id === itemId ? { ...r, description: mem.description || r.description, likelihood: (mem.likelihood as RiskLikelihood) || r.likelihood, impact: (mem.impact as RiskImpact) || r.impact, status: (mem.status as RiskStatus) || r.status, mitigation: mem.mitigation || r.mitigation, code: upperCode } : r) } : a));
@@ -1031,7 +990,8 @@ const deleteItemFromActivity = (category: EntryCategory, itemId: string) => {
   };
 
   const handleSave = async () => {
-    const report: DailyReport = { id: reportId, userId: currentUserId, createdAt: existingReport?.createdAt || Date.now(), updatedAt: Date.now(), date, activities: activities.map(sanitizeActivity) as any };
+    try {
+    const report: DailyReport = { id: reportId, userId: currentUserId, createdAt: existingReport?.createdAt || Date.now(), updatedAt: Date.now(), date, activities };
     const newMemory: ResourceMemory = {
       ...resourceMemory,
       manpower: { ...(resourceMemory as any).manpower },
@@ -1070,15 +1030,27 @@ const deleteItemFromActivity = (category: EntryCategory, itemId: string) => {
     });
     setResourceMemory(newMemory);
     await StorageService.saveResourceMemory(currentUserId, newMemory);
-    await StorageService.saveReport(report);
-    onSave(report);
+    // Local save (optional). Do not block Firebase save if this fails.
+    try {
+      await StorageService.saveReport(report);
+    } catch (e) {
+      console.warn('Local saveReport failed (continuing with Firebase save):', e);
+    }
+    // Firebase save via App.tsx callback
+    await Promise.resolve(onSave(report));
     window.scrollTo({ top: 0, behavior: 'smooth' });
     setShowSavedDialog(true);
+    } catch (e) {
+      console.error('Save failed:', e);
+      const msg = (e && typeof e === 'object' && 'message' in (e as any)) ? String((e as any).message) : String(e);
+      alert('Save failed: ' + msg);
+    }
+
   };
 
   const handleCopyReport = async () => {
     if (!copyTargetDate) return;
-    const report: DailyReport = { id: generateId(), userId: currentUserId, createdAt: Date.now(), updatedAt: Date.now(), date: copyTargetDate, activities: activities.map(sanitizeActivity) as any };
+    const report: DailyReport = { id: generateId(), userId: currentUserId, createdAt: Date.now(), updatedAt: Date.now(), date: copyTargetDate, activities: JSON.parse(JSON.stringify(activities)) };
     await StorageService.saveReport(report);
     setToastMessage(`Record duplicated to ${copyTargetDate}`);
     setShowCopyModal(false);
